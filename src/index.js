@@ -2,109 +2,168 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/update") {
-      return handleUpdate(request, env);
-    }
+    try {
+      if (url.pathname === "/update") {
+        return await handleUpdate(request, env);
+      }
 
-    if (url.pathname === "/webhook") {
-      return handleWebhook(request, env);
-    }
+      if (url.pathname === "/webhook") {
+        return await handleWebhook(request, env);
+      }
 
-    return new Response("Not Found", { status: 404 });
+      return jsonResponse({ error: "Not Found" }, 404);
+    } catch (err) {
+      return jsonResponse(
+        { error: err.message || "Internal Error" },
+        500
+      );
+    }
   },
 };
 
-// ==============================
-// 1️⃣ 更新文件
-// ==============================
+//////////////////////////////////////////////////////
+// 更新文件接口
+//////////////////////////////////////////////////////
 async function handleUpdate(request, env) {
-  const body = await request.json();
-  const newContent = body.content;
-
-  if (!newContent) {
-    return new Response("Missing content", { status: 400 });
+  if (request.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
-  // 获取文件 SHA
-  const fileRes = await fetch(
+  const body = await safeParseRequestJSON(request);
+  if (!body.content) {
+    return jsonResponse({ error: "Missing content" }, 400);
+  }
+
+  // 1️⃣ 获取当前文件 SHA
+  const fileData = await safeGitHubRequest(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${env.FILE_PATH}?ref=${env.BRANCH}`,
-    {
-      headers: {
-        Authorization: `Bearer ${env.GH_TOKEN}`,
-        Accept: "application/vnd.github+json",
-      },
-    }
+    env
   );
 
-  const fileData = await fileRes.json();
+  if (!fileData.sha) {
+    throw new Error("File not found or no permission");
+  }
 
-  // 更新文件
-  const updateRes = await fetch(
+  // 2️⃣ 更新文件
+  const updateResult = await safeGitHubRequest(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${env.FILE_PATH}`,
+    env,
     {
       method: "PUT",
-      headers: {
-        Authorization: `Bearer ${env.GH_TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-      },
       body: JSON.stringify({
         message: "auto update images.txt",
-        content: btoa(unescape(encodeURIComponent(newContent))),
+        content: base64Encode(body.content),
         sha: fileData.sha,
         branch: env.BRANCH,
       }),
     }
   );
 
-  const result = await updateRes.json();
-
-  return new Response(
-    JSON.stringify({
-      message: "Update triggered",
-      commit: result.commit?.sha,
-    }),
-    { headers: { "Content-Type": "application/json" } }
-  );
+  return jsonResponse({
+    message: "Update triggered",
+    commit: updateResult.commit?.sha,
+  });
 }
 
-// ==============================
-// 2️⃣ Webhook 接收 & 签名验证
-// ==============================
+//////////////////////////////////////////////////////
+// Webhook 接收接口
+//////////////////////////////////////////////////////
 async function handleWebhook(request, env) {
-  const signature = request.headers.get("x-hub-signature-256");
-  const body = await request.text();
-
-  const valid = await verifySignature(body, signature, env.WEBHOOK_SECRET);
-
-  if (!valid) {
-    return new Response("Invalid signature", { status: 401 });
+  if (request.method !== "POST") {
+    return new Response("OK");
   }
 
-  const payload = JSON.parse(body);
+  const signature = request.headers.get("x-hub-signature-256");
+  const rawBody = await request.text();
 
-  if (payload.action === "completed") {
+  const valid = await verifySignature(
+    rawBody,
+    signature,
+    env.WEBHOOK_SECRET
+  );
+
+  if (!valid) {
+    return jsonResponse({ error: "Invalid signature" }, 401);
+  }
+
+  const payload = JSON.parse(rawBody);
+
+  if (
+    payload.action === "completed" &&
+    payload.workflow_run
+  ) {
     const run = payload.workflow_run;
 
-    return new Response(
-      JSON.stringify({
-        workflow: run.name,
-        status: run.status,
-        conclusion: run.conclusion,
-        commit: run.head_sha,
-      }),
-      { headers: { "Content-Type": "application/json" } }
+    return jsonResponse({
+      workflow: run.name,
+      status: run.status,
+      conclusion: run.conclusion,
+      commit: run.head_sha,
+    });
+  }
+
+  return jsonResponse({ message: "Ignored event" });
+}
+
+//////////////////////////////////////////////////////
+// GitHub 请求封装（安全 JSON 解析）
+//////////////////////////////////////////////////////
+async function safeGitHubRequest(url, env, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `GitHub 返回非 JSON 响应:\n${text}`
     );
   }
 
-  return new Response("Ignored");
+  if (!response.ok) {
+    throw new Error(
+      `GitHub API 错误 ${response.status}:\n${JSON.stringify(
+        data,
+        null,
+        2
+      )}`
+    );
+  }
+
+  return data;
 }
 
-// ==============================
-// 3️⃣ HMAC SHA256 校验
-// ==============================
+//////////////////////////////////////////////////////
+// 安全解析请求 JSON
+//////////////////////////////////////////////////////
+async function safeParseRequestJSON(request) {
+  const text = await request.text();
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON body");
+  }
+}
+
+//////////////////////////////////////////////////////
+// HMAC SHA256 验证
+//////////////////////////////////////////////////////
 async function verifySignature(body, signature, secret) {
+  if (!signature) return false;
+
   const encoder = new TextEncoder();
+
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(secret),
@@ -120,10 +179,27 @@ async function verifySignature(body, signature, secret) {
   );
 
   const hash = Array.from(new Uint8Array(digest))
-    .map(b => b.toString(16).padStart(2, "0"))
+    .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
   const expected = `sha256=${hash}`;
 
   return expected === signature;
+}
+
+//////////////////////////////////////////////////////
+// Base64 编码（UTF-8 安全）
+//////////////////////////////////////////////////////
+function base64Encode(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+//////////////////////////////////////////////////////
+// JSON Response Helper
+//////////////////////////////////////////////////////
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
