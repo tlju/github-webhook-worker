@@ -115,6 +115,7 @@ async function safeGitHubRequest(url, env, options = {}) {
       Authorization: `Bearer ${env.GH_TOKEN}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
+      "User-Agent": "cloudflare-worker",
       ...(options.headers || {}),
     },
   });
@@ -125,18 +126,12 @@ async function safeGitHubRequest(url, env, options = {}) {
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(
-      `GitHub 返回非 JSON 响应:\n${text}`
-    );
+    throw new Error(`GitHub 返回非 JSON 响应:\n${text}`);
   }
 
   if (!response.ok) {
     throw new Error(
-      `GitHub API 错误 ${response.status}:\n${JSON.stringify(
-        data,
-        null,
-        2
-      )}`
+      `GitHub API 错误 ${response.status}:\n${JSON.stringify(data, null, 2)}`
     );
   }
 
