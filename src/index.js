@@ -1,34 +1,37 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // 注意：如果你的绑定名包含横杠，需使用 env["docker-image-pusher"] 这种写法
+    const kv = env["docker-image-pusher"];
+
+    if (!kv) {
+      return jsonResponse({ error: "KV binding 'docker-image-pusher' not found." }, 500);
+    }
 
     try {
-      // 1. 处理 Docker Registry 镜像加速路由 (优先级最高)
+      // 1. Docker Registry 路由 (无需 KV 配置即可运行，仅作重试触发)
       if (url.pathname.startsWith("/v2/")) {
         return await handleRegistry(request);
       }
 
-      // 2. 处理原有业务路由
+      // 2. 业务路由
       if (url.pathname === "/update") {
-        return await handleUpdate(request, env);
+        return await handleUpdate(request, kv);
       }
 
       if (url.pathname === "/webhook") {
-        return await handleWebhook(request, env);
+        return await handleWebhook(request, kv);
       }
 
       return jsonResponse({ error: "Not Found" }, 404);
     } catch (err) {
-      return jsonResponse(
-        { error: err.message || "Internal Error" },
-        500
-      );
+      return jsonResponse({ error: err.message || "Internal Error" }, 500);
     }
   },
 };
 
 //////////////////////////////////////////////////////
-// Docker Registry 模拟逻辑 (触发重试)
+// Docker Registry 逻辑 (触发 429 重试)
 //////////////////////////////////////////////////////
 async function handleRegistry(request) {
   const url = new URL(request.url);
@@ -37,38 +40,26 @@ async function handleRegistry(request) {
     "Docker-Distribution-API-Version": "registry/2.0",
   };
 
-  // 响应版本检查 (GET /v2/)，必须返回 200 才能引导 Docker 继续请求
   if (url.pathname === "/v2/" || url.pathname === "/v2") {
-    return new Response(JSON.stringify({}), {
-      status: 200,
-      headers: registryHeaders,
-    });
+    return new Response(JSON.stringify({}), { status: 200, headers: registryHeaders });
   }
 
-  // 对所有具体的镜像拉取请求 (Manifest/Blobs) 返回 429 触发重试
-  const errorPayload = {
-    errors: [
-      {
-        code: "UNAVAILABLE",
-        message: "Resource temporarily unavailable, triggering retry mechanism",
-        detail: "Simulated by Cloudflare Worker",
-      },
-    ],
-  };
-
-  return new Response(JSON.stringify(errorPayload), {
-    status: 429, 
-    headers: {
-      ...registryHeaders,
-      "Retry-After": "5", // 告知 Docker 5秒后重试
-    },
-  });
+  // 返回 429 强制 Docker 客户端重试
+  return new Response(
+    JSON.stringify({
+      errors: [{ code: "UNAVAILABLE", message: "Triggering Docker Retry" }]
+    }),
+    {
+      status: 429,
+      headers: { ...registryHeaders, "Retry-After": "5" },
+    }
+  );
 }
 
 //////////////////////////////////////////////////////
-// 更新文件接口 (已改进：动态 Message)
+// 更新文件接口 (使用 Promise.all 并发读取 KV)
 //////////////////////////////////////////////////////
-async function handleUpdate(request, env) {
+async function handleUpdate(request, kv) {
   if (request.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
@@ -78,136 +69,113 @@ async function handleUpdate(request, env) {
     return jsonResponse({ error: "Missing content" }, 400);
   }
 
-  // 1️⃣ 获取当前文件 SHA
-  const fileData = await safeGitHubRequest(
-    `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${env.FILE_PATH}?ref=${env.BRANCH}`,
-    env
-  );
+  // 🚀 并发读取所有配置，减少等待时间
+  const [owner, repo, filePath, branch, token] = await Promise.all([
+    kv.get("GITHUB_OWNER"),
+    kv.get("GITHUB_REPO"),
+    kv.get("FILE_PATH"),
+    kv.get("BRANCH"),
+    kv.get("GH_TOKEN"),
+  ]);
 
-  if (!fileData.sha) {
-    throw new Error("File not found or no permission");
+  if (!owner || !repo || !token) {
+    throw new Error("Missing KV config: GITHUB_OWNER, GITHUB_REPO, or GH_TOKEN");
   }
 
-  // 2️⃣ 更新文件 (改进点：使用动态文件名作为提交信息)
+  // 1️⃣ 获取文件当前 SHA
+  const fileData = await safeGitHubRequest(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`,
+    token
+  );
+
+  // 2️⃣ 提交更新
   const updateResult = await safeGitHubRequest(
-    `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${env.FILE_PATH}`,
-    env,
+    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`,
+    token,
     {
       method: "PUT",
       body: JSON.stringify({
-        message: `auto update ${env.FILE_PATH} via worker`,
+        message: `auto update ${filePath} via worker`,
         content: base64Encode(body.content),
         sha: fileData.sha,
-        branch: env.BRANCH,
+        branch: branch,
       }),
     }
   );
 
-  return jsonResponse({
-    message: "Update triggered",
-    commit: updateResult.commit?.sha,
-  });
+  return jsonResponse({ message: "Update success", commit: updateResult.commit?.sha });
 }
 
 //////////////////////////////////////////////////////
 // Webhook 接收接口
 //////////////////////////////////////////////////////
-async function handleWebhook(request, env) {
-  if (request.method !== "POST") {
-    return new Response("OK");
-  }
+async function handleWebhook(request, kv) {
+  if (request.method !== "POST") return new Response("OK");
 
+  const secret = await kv.get("WEBHOOK_SECRET");
   const signature = request.headers.get("x-hub-signature-256");
   const rawBody = await request.text();
 
-  const valid = await verifySignature(
-    rawBody,
-    signature,
-    env.KV.get('WEBHOOK_SECRET')
-  );
-
-  if (!valid) {
+  if (!(await verifySignature(rawBody, signature, secret))) {
     return jsonResponse({ error: "Invalid signature" }, 401);
   }
 
   const payload = JSON.parse(rawBody);
-
   if (payload.action === "completed" && payload.workflow_run) {
-    const run = payload.workflow_run;
     return jsonResponse({
-      workflow: run.name,
-      status: run.status,
-      conclusion: run.conclusion,
-      commit: run.head_sha,
+      workflow: payload.workflow_run.name,
+      status: payload.workflow_run.status,
+      conclusion: payload.workflow_run.conclusion,
     });
   }
 
-  return jsonResponse({ message: "Ignored event" });
+  return jsonResponse({ message: "Ignored" });
 }
 
 //////////////////////////////////////////////////////
-// 工具函数封装
+// 工具函数 (现代化与安全封装)
 //////////////////////////////////////////////////////
 
-async function safeGitHubRequest(url, env, options = {}) {
+async function safeGitHubRequest(url, token, options = {}) {
   const response = await fetch(url, {
     ...options,
     headers: {
-      Authorization: `Bearer ${env.KV.get('GH_TOKEN')}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "User-Agent": "cloudflare-worker",
+      "User-Agent": "cf-worker-pusher",
       ...(options.headers || {}),
     },
   });
 
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`GitHub 返回非 JSON 响应:\n${text}`);
-  }
-
+  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(`GitHub API 错误 ${response.status}:\n${JSON.stringify(data, null, 2)}`);
+    throw new Error(`GitHub Error ${response.status}: ${JSON.stringify(data)}`);
   }
-
   return data;
 }
 
 async function safeParseRequestJSON(request) {
-  const text = await request.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("Invalid JSON body");
-  }
+  try { return await request.json(); } 
+  catch { throw new Error("Invalid JSON body"); }
 }
 
 async function verifySignature(body, signature, secret) {
-  if (!signature) return false;
+  if (!signature || !secret) return false;
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
+    "raw", encoder.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
+    false, ["sign"]
   );
   const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-  const hash = Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const hash = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
   return `sha256=${hash}` === signature;
 }
 
-/**
- * 🚀 改进点：现代化的 Base64 编码 (替代 unescape)
- */
 function base64Encode(str) {
   const bytes = new TextEncoder().encode(str);
-  const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+  const binString = Array.from(bytes, byte => String.fromCharCode(byte)).join("");
   return btoa(binString);
 }
 
