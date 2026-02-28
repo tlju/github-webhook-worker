@@ -2,39 +2,52 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const kv = env.DOCKER_KV;
-    if (!kv) return jsonResponse({ error: "KV not bound" }, 500);
+
+    if (!kv) {
+      return new Response("KV not bound", { status: 500 });
+    }
 
     try {
-      if (url.pathname === "/login") return handleLogin(request, kv);
-      if (url.pathname === "/logout") return handleLogout();
+      if (url.pathname === "/login") {
+        return handleLogin(request, kv);
+      }
+
+      if (url.pathname === "/logout") {
+        return handleLogout();
+      }
 
       if (url.pathname === "/ui") {
-        if (!(await isAuthenticated(request, kv))) return loginPage();
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return loginPage();
         return uiPage(kv);
       }
 
       if (url.pathname === "/update") {
-        if (!(await isAuthenticated(request, kv)))
-          return jsonResponse({ error: "Unauthorized" }, 401);
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return json({ error: "Unauthorized" }, 401);
         return handleUpdate(request, kv);
       }
 
-      if (url.pathname === "/webhook")
+      if (url.pathname === "/webhook") {
         return handleWebhook(request, kv);
+      }
 
       return new Response("Not Found", { status: 404 });
-    } catch (e) {
-      return jsonResponse({ error: e.message }, 500);
+
+    } catch (err) {
+      return json({ error: err.message }, 500);
     }
-  },
+  }
 };
 
-///////////////////////////////////////////////////////
+//////////////////////////////////////////////////////
 // 登录逻辑
-///////////////////////////////////////////////////////
+//////////////////////////////////////////////////////
 
 async function handleLogin(request, kv) {
-  if (request.method !== "POST") return loginPage("请使用表单登录");
+  if (request.method !== "POST") {
+    return loginPage();
+  }
 
   const form = await request.formData();
   const username = form.get("username");
@@ -43,11 +56,12 @@ async function handleLogin(request, kv) {
   const [kvUser, kvPass, secret] = await Promise.all([
     kv.get("UI_USERNAME"),
     kv.get("UI_PASSWORD"),
-    kv.get("SESSION_SECRET"),
+    kv.get("SESSION_SECRET")
   ]);
 
   if (username === kvUser && password === kvPass) {
     const token = await signValue(username, secret);
+
     return new Response(null, {
       status: 302,
       headers: {
@@ -87,7 +101,7 @@ async function isAuthenticated(request, kv) {
 async function uiPage(kv) {
   const lastWorkflow = await kv.get("LAST_WORKFLOW");
 
-  return htmlResponse(`
+  return html(`
 <!doctype html>
 <html>
 <head>
@@ -140,7 +154,7 @@ async function submitUpdate(){
 }
 
 function loginPage(msg="") {
-  return htmlResponse(`
+  return html(`
 <html>
 <body style="font-family:system-ui;background:#f4f6fb;padding:40px">
 <div style="background:#fff;padding:30px;border-radius:12px;max-width:400px;margin:auto">
@@ -162,40 +176,44 @@ function loginPage(msg="") {
 //////////////////////////////////////////////////////
 
 async function handleUpdate(request, kv) {
-  if (request.method !== "POST")
-    return jsonResponse({ error: "Method not allowed" }, 405);
+  if (request.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
+  }
 
   const body = await request.json();
-  if (!body.content) return jsonResponse({ error: "Missing content" }, 400);
+  if (!body.content) {
+    return json({ error: "Missing content" }, 400);
+  }
 
   const [owner, repo, filePath, branch, token] = await Promise.all([
     kv.get("GITHUB_OWNER"),
     kv.get("GITHUB_REPO"),
     kv.get("FILE_PATH"),
     kv.get("BRANCH"),
-    kv.get("GH_TOKEN"),
+    kv.get("GH_TOKEN")
   ]);
 
+  const ref = branch || "main";
+
   const getUrl =
-    \`https://api.github.com/repos/\${owner}/\${repo}/contents/\${filePath}?ref=\${branch||"main"}\`;
+    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${ref}`;
 
   const fileData = await safeGitHubRequest(getUrl, token);
 
-  const updateResult = await safeGitHubRequest(
-    \`https://api.github.com/repos/\${owner}/\${repo}/contents/\${filePath}\`,
-    token,
-    {
-      method:"PUT",
-      body:JSON.stringify({
-        message:"auto update via worker",
-        content:base64Encode(body.content),
-        sha:fileData.sha,
-        branch:branch||"main"
-      })
-    }
-  );
+  const putUrl =
+    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
 
-  return jsonResponse({ ok:true, commit:updateResult.commit.sha });
+  const updateResult = await safeGitHubRequest(putUrl, token, {
+    method: "PUT",
+    body: JSON.stringify({
+      message: "auto update via worker",
+      content: base64Encode(body.content),
+      sha: fileData.sha,
+      branch: ref
+    })
+  });
+
+  return json({ ok: true, commit: updateResult.commit.sha });
 }
 
 //////////////////////////////////////////////////////
@@ -203,16 +221,19 @@ async function handleUpdate(request, kv) {
 //////////////////////////////////////////////////////
 
 async function handleWebhook(request, kv) {
-  if (request.method !== "POST") return new Response("OK");
+  if (request.method !== "POST") {
+    return new Response("OK");
+  }
 
   const secret = await kv.get("WEBHOOK_SECRET");
   const signature = request.headers.get("x-hub-signature-256");
-  const body = await request.text();
+  const rawBody = await request.text();
 
-  if (!(await verifySignature(body, signature, secret)))
-    return jsonResponse({ error: "Invalid signature" }, 401);
+  if (!(await verifySignature(rawBody, signature, secret))) {
+    return json({ error: "Invalid signature" }, 401);
+  }
 
-  const payload = JSON.parse(body);
+  const payload = JSON.parse(rawBody);
 
   if (payload.workflow_run) {
     const info = JSON.stringify({
@@ -225,42 +246,96 @@ async function handleWebhook(request, kv) {
     await kv.put("LAST_WORKFLOW", info);
   }
 
-  return jsonResponse({ ok: true });
+  return json({ ok: true });
 }
 
 //////////////////////////////////////////////////////
 // 工具函数
 //////////////////////////////////////////////////////
 
-async function signValue(value, secret){
-  const key = await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-  const sig = await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(value));
-  return value+"."+btoa(String.fromCharCode(...new Uint8Array(sig)));
+async function safeGitHubRequest(url, token, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(JSON.stringify(data));
+  }
+
+  return data;
 }
 
-async function verifyValue(token, secret){
+async function signValue(value, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(value)
+  );
+
+  return value + "." + btoa(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+async function verifyValue(token, secret) {
   const parts = token.split(".");
-  if(parts.length!==2) return false;
+  if (parts.length !== 2) return false;
   const valid = await signValue(parts[0], secret);
-  return valid===token;
+  return valid === token;
 }
 
-async function verifySignature(body, signature, secret){
-  if(!signature||!secret) return false;
-  const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-  const sig=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(body));
-  const hex="sha256="+Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,'0')).join('');
-  return hex===signature;
+async function verifySignature(body, signature, secret) {
+  if (!signature || !secret) return false;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(body)
+  );
+
+  const hex = "sha256=" +
+    Array.from(new Uint8Array(sig))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
+
+  return hex === signature;
 }
 
-function base64Encode(str){
+function base64Encode(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
-function jsonResponse(obj,status=200){
-  return new Response(JSON.stringify(obj),{status,headers:{"Content-Type":"application/json"}});
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
-function htmlResponse(html){
-  return new Response(html,{headers:{"Content-Type":"text/html"}});
+function html(content) {
+  return new Response(content, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
