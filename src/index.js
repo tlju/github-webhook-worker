@@ -51,7 +51,8 @@ async function handleUpdate(request, env) {
     {
       method: "PUT",
       body: JSON.stringify({
-        message: "auto update images.txt",
+        // 🚀 改进建议：使用动态 Commit Message
+        message: `auto update ${env.FILE_PATH} via Worker`,
         content: base64Encode(body.content),
         sha: fileData.sha,
         branch: env.BRANCH,
@@ -106,7 +107,7 @@ async function handleWebhook(request, env) {
 }
 
 //////////////////////////////////////////////////////
-// GitHub 请求封装（安全 JSON 解析）
+// GitHub 请求封装
 //////////////////////////////////////////////////////
 async function safeGitHubRequest(url, env, options = {}) {
   const response = await fetch(url, {
@@ -121,7 +122,6 @@ async function safeGitHubRequest(url, env, options = {}) {
   });
 
   const text = await response.text();
-
   let data;
   try {
     data = JSON.parse(text);
@@ -138,12 +138,8 @@ async function safeGitHubRequest(url, env, options = {}) {
   return data;
 }
 
-//////////////////////////////////////////////////////
-// 安全解析请求 JSON
-//////////////////////////////////////////////////////
 async function safeParseRequestJSON(request) {
   const text = await request.text();
-
   try {
     return JSON.parse(text);
   } catch {
@@ -151,14 +147,9 @@ async function safeParseRequestJSON(request) {
   }
 }
 
-//////////////////////////////////////////////////////
-// HMAC SHA256 验证
-//////////////////////////////////////////////////////
 async function verifySignature(body, signature, secret) {
   if (!signature) return false;
-
   const encoder = new TextEncoder();
-
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(secret),
@@ -166,32 +157,27 @@ async function verifySignature(body, signature, secret) {
     false,
     ["sign"]
   );
-
   const digest = await crypto.subtle.sign(
     "HMAC",
     key,
     encoder.encode(body)
   );
-
   const hash = Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-
   const expected = `sha256=${hash}`;
-
   return expected === signature;
 }
 
 //////////////////////////////////////////////////////
-// Base64 编码（UTF-8 安全）
+// 🚀 改进建议：现代化的 Base64 编码（支持 UTF-8）
 //////////////////////////////////////////////////////
 function base64Encode(str) {
-  return btoa(unescape(encodeURIComponent(str)));
+  const bytes = new TextEncoder().encode(str);
+  const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+  return btoa(binString);
 }
 
-//////////////////////////////////////////////////////
-// JSON Response Helper
-//////////////////////////////////////////////////////
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
