@@ -1,9 +1,4 @@
 export default {
-  /**
-   * Worker 入口函数
-   * @param {Request} request 
-   * @param {object} env 环境变量，包含 KV 绑定 DOCKER_KV
-   */
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -17,36 +12,45 @@ export default {
     }
 
     try {
+      // 调试信息
+      console.log("Request path:", url.pathname);
+      console.log("Request method:", request.method);
+      
       // 1️⃣ 处理 Docker Token 鉴权代理
       if (url.pathname === "/v2/auth") {
         return await handleAuth(request, kv);
       }
 
-      // 2️⃣ 处理 Docker Registry 路由 (反向代理到阿里云)
+      // 2️⃣ 处理 Docker Registry 路径映射
       if (url.pathname.startsWith("/v2/")) {
         return await handleRegistry(request, kv);
       }
 
-      // 3️⃣ 处理业务路由 (GitHub 更新)
+      // 3️⃣ 调试接口
+      if (url.pathname === "/debug") {
+        return await handleDebug(request, kv);
+      }
+
+      // 4️⃣ 处理业务路由 (GitHub 更新)
       if (url.pathname === "/update") {
         return await handleUpdate(request, kv);
       }
 
-      // 4️⃣ 处理业务路由 (Webhook)
+      // 5️⃣ 处理业务路由 (Webhook)
       if (url.pathname === "/webhook") {
         return await handleWebhook(request, kv);
       }
 
       return jsonResponse({ error: "Not Found" }, 404);
     } catch (err) {
+      console.error("Error in fetch:", err);
       return jsonResponse({ error: err.message || "Internal Error" }, 500);
     }
   },
 };
 
 /**
- * Docker Registry 代理逻辑
- * 拦截请求，修改路径，处理 401 鉴权挑战
+ * Docker Registry 代理逻辑 - 修复版本
  */
 async function handleRegistry(request, kv) {
   const url = new URL(request.url);
@@ -57,26 +61,40 @@ async function handleRegistry(request, kv) {
     return jsonResponse({ error: "KV 缺少 ALIYUN_REGISTRY 配置" }, 500);
   }
   
-  // 你的目标命名空间 (如果以后有变，也可以提出来放进 KV)
-  const targetNamespace = "tlju-docker-images";
+  // 目标命名空间
+  const targetNamespace = await kv.get("TARGET_NAMESPACE") || "tlju-docker-images";
 
   let targetPath = url.pathname;
 
-  // 核心逻辑：路径重写
-  // 匹配类似 /v2/library/python/manifests/latest
+  // 路径重写逻辑
   if (targetPath !== "/v2/" && targetPath !== "/v2") {
     const match = targetPath.match(/^\/v2\/(.+)\/(manifests|blobs)\/(.+)$/);
     if (match) {
-      const originalRepo = match[1]; // 例如 "library/python"
-      const action = match[2];       // "manifests" 或 "blobs"
-      const reference = match[3];    // "latest" 或 "sha256:..."
+      const originalRepo = match[1];
+      const action = match[2];
+      const reference = match[3];
 
-      const imageName = originalRepo.split('/').pop();
+      // 从原始仓库名提取镜像名
+      const parts = originalRepo.split('/');
+      let imageName = originalRepo; // 默认使用完整路径
+      
+      // 如果是 library/ 前缀，则只取最后一部分
+      if (originalRepo.startsWith('library/')) {
+        imageName = parts[parts.length - 1];
+      } else {
+        // 如果包含多个部分，用连字符连接
+        imageName = parts.join('-');
+      }
+      
       targetPath = `/v2/${targetNamespace}/${imageName}/${action}/${reference}`;
     }
   }
 
   const targetUrl = new URL(`https://${targetHost}${targetPath}${url.search}`);
+
+  console.log("Original path:", url.pathname);
+  console.log("Target path:", targetPath);
+  console.log("Target URL:", targetUrl.toString());
 
   const headers = new Headers(request.headers);
   headers.set("Host", targetHost);
@@ -84,8 +102,6 @@ async function handleRegistry(request, kv) {
   const fetchInit = {
     method: request.method,
     headers: headers,
-    // 关键：必须设为 manual。这样当阿里云返回 OSS 的下载链接 (307) 时，
-    // Worker 会把链接直接丢给 Docker 客户端，让 Docker 直接去 OSS 下载，既省 Worker 流量又防止鉴权头冲突。
     redirect: "manual", 
   };
 
@@ -94,42 +110,45 @@ async function handleRegistry(request, kv) {
   }
 
   // 向阿里云发起请求
-  const response = await fetch(targetUrl, fetchInit);
-  const proxyResponse = new Response(response.body, response);
+  try {
+    const response = await fetch(targetUrl, fetchInit);
+    const proxyResponse = new Response(response.body, response);
 
-  // 🌟 无感鉴权核心：拦截 401，篡改 Www-Authenticate 的 realm
-  if (proxyResponse.status === 401) {
-    const authHeader = proxyResponse.headers.get("Www-Authenticate");
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      const realmMatch = authHeader.match(/realm="([^"]+)"/);
-      if (realmMatch) {
-        const originalRealm = realmMatch[1];
-        // 把真实的鉴权地址藏在 url 参数里，让 Docker 客户端来请求 Worker 的 /v2/auth
-        const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}`;
-        const newAuthHeader = authHeader.replace(originalRealm, newRealm);
-        proxyResponse.headers.set("Www-Authenticate", newAuthHeader);
+    // 处理 401 鉴权
+    if (proxyResponse.status === 401) {
+      const authHeader = proxyResponse.headers.get("Www-Authenticate");
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const realmMatch = authHeader.match(/realm="([^"]+)"/);
+        if (realmMatch) {
+          const originalRealm = realmMatch[1];
+          const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}`;
+          const newAuthHeader = authHeader.replace(originalRealm, newRealm);
+          proxyResponse.headers.set("Www-Authenticate", newAuthHeader);
+        }
       }
     }
-  }
 
-  proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
-  return proxyResponse;
+    proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
+    return proxyResponse;
+  } catch (error) {
+    console.error("Fetch error:", error);
+    return jsonResponse({ error: `Upstream request failed: ${error.message}` }, 502);
+  }
 }
 
 /**
- * 代理获取 Token
- * 使用 KV 里的账密，帮客户端从真实的阿里云 Auth 服务器获取 Token
+ * 代理获取 Token - 修复版本
  */
 async function handleAuth(request, kv) {
   const url = new URL(request.url);
   
-  // 拿到刚才藏起来的真实鉴权地址
+  // 拿到真实鉴权地址
   const upstreamRealm = url.searchParams.get("upstream_realm");
   if (!upstreamRealm) {
     return jsonResponse({ error: "Missing upstream_realm parameter" }, 400);
   }
 
-  // 重组请求阿里云的 URL（带上 service 和 scope 等参数）
+  // 重组请求阿里云的 URL
   const upstreamUrl = new URL(upstreamRealm);
   url.searchParams.forEach((value, key) => {
     if (key !== "upstream_realm") {
@@ -137,35 +156,87 @@ async function handleAuth(request, kv) {
     }
   });
 
+  console.log("Auth request to:", upstreamUrl.toString());
+
   // 并发读取账号密码
   const [user, pass] = await Promise.all([
     kv.get("ALIYUN_REGISTRY_USER"),
     kv.get("ALIYUN_REGISTRY_PASSWORD")
   ]);
 
+  if (!user || !pass) {
+    return jsonResponse({ error: "Missing ALIYUN_REGISTRY credentials in KV" }, 500);
+  }
+
   const headers = new Headers();
   headers.set("Accept", request.headers.get("Accept") || "application/json");
   headers.set("User-Agent", request.headers.get("User-Agent") || "Cloudflare-Worker-Proxy");
 
-  // 将账密转为 Basic 认证头注入
-  if (user && pass) {
-    const authStr = btoa(`${user}:${pass}`);
-    headers.set("Authorization", `Basic ${authStr}`);
+  // 设置 Basic 认证
+  const authStr = btoa(`${user}:${pass}`);
+  headers.set("Authorization", `Basic ${authStr}`);
+
+  try {
+    // 去阿里云获取 Token
+    const tokenRes = await fetch(upstreamUrl.toString(), {
+      method: "GET",
+      headers: headers
+    });
+
+    console.log("Auth response status:", tokenRes.status);
+
+    if (!tokenRes.ok) {
+      const errorText = await tokenRes.text();
+      console.error("Auth failed:", errorText);
+      return jsonResponse({ error: `Auth failed: ${errorText}` }, tokenRes.status);
+    }
+
+    const proxyTokenRes = new Response(tokenRes.body, tokenRes);
+    proxyTokenRes.headers.set("Access-Control-Allow-Origin", "*");
+    return proxyTokenRes;
+  } catch (error) {
+    console.error("Auth request error:", error);
+    return jsonResponse({ error: `Auth request failed: ${error.message}` }, 502);
   }
+}
 
-  // 去阿里云真正获取 Token
-  const tokenRes = await fetch(upstreamUrl.toString(), {
-    method: "GET",
-    headers: headers
+/**
+ * 调试接口
+ */
+async function handleDebug(request, kv) {
+  // 获取所有配置值
+  const config = {};
+  const keys = [
+    'ALIYUN_REGISTRY',
+    'ALIYUN_REGISTRY_USER', 
+    'TARGET_NAMESPACE',
+    'GITHUB_OWNER',
+    'GITHUB_REPO',
+    'FILE_PATH',
+    'BRANCH',
+    'GH_TOKEN',
+    'WEBHOOK_SECRET'
+  ];
+  
+  for (const key of keys) {
+    config[key] = await kv.get(key);
+  }
+  
+  // 检查必需的配置
+  const missing = [];
+  if (!config.ALIYUN_REGISTRY) missing.push('ALIYUN_REGISTRY');
+  if (!config.ALIYUN_REGISTRY_USER) missing.push('ALIYUN_REGISTRY_USER');
+  
+  return jsonResponse({
+    config,
+    missingConfig: missing,
+    timestamp: new Date().toISOString(),
+    status: missing.length === 0 ? 'OK' : 'CONFIG_ERROR'
   });
-
-  const proxyTokenRes = new Response(tokenRes.body, tokenRes);
-  proxyTokenRes.headers.set("Access-Control-Allow-Origin", "*");
-  return proxyTokenRes;
 }
 
 //////////////////////////////////////////////////////
-// 更新 GitHub 文件接口 (保持不变)
+// 更新 GitHub 文件接口
 //////////////////////////////////////////////////////
 async function handleUpdate(request, kv) {
   if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
@@ -197,7 +268,7 @@ async function handleUpdate(request, kv) {
 }
 
 //////////////////////////////////////////////////////
-// Webhook 接收接口 (保持不变)
+// Webhook 接收接口
 //////////////////////////////////////////////////////
 async function handleWebhook(request, kv) {
   if (request.method !== "POST") return new Response("OK");
@@ -217,7 +288,7 @@ async function handleWebhook(request, kv) {
 }
 
 //////////////////////////////////////////////////////
-// 工具函数 (保持不变)
+// 工具函数
 //////////////////////////////////////////////////////
 async function safeGitHubRequest(url, token, options = {}) {
   const response = await fetch(url, {
