@@ -2,6 +2,10 @@ name = "github-webhook-worker"
 main = "src/index.js"
 compatibility_date = "2026-02-27"
 
+[[kv_namespaces]]
+binding = "DOCKER_KV"  # 代码中引用的变量名
+id = "f49a43bc61f84389a3d191c08836a482" # 控制面板里那个长长的 ID
+
 [observability]
 enabled = false
 head_sampling_rate = 1
