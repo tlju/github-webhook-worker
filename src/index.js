@@ -12,31 +12,34 @@ export default {
     }
 
     try {
-      // 调试信息
-      console.log("Request path:", url.pathname);
-      console.log("Request method:", request.method);
+      console.log("Incoming request:", request.method, url.pathname);
       
       // 1️⃣ 处理 Docker Token 鉴权代理
       if (url.pathname === "/v2/auth") {
         return await handleAuth(request, kv);
       }
 
-      // 2️⃣ 处理 Docker Registry 路径映射
+      // 2️⃣ 处理 Docker Registry 路由
       if (url.pathname.startsWith("/v2/")) {
         return await handleRegistry(request, kv);
       }
 
-      // 3️⃣ 调试接口
+      // 3️⃣ 调试接口 - 显示当前配置和测试连接
       if (url.pathname === "/debug") {
         return await handleDebug(request, kv);
       }
 
-      // 4️⃣ 处理业务路由 (GitHub 更新)
+      // 4️⃣ 连通性测试接口
+      if (url.pathname === "/test-connectivity") {
+        return await handleConnectivityTest(request, kv);
+      }
+
+      // 5️⃣ 处理业务路由 (GitHub 更新)
       if (url.pathname === "/update") {
         return await handleUpdate(request, kv);
       }
 
-      // 5️⃣ 处理业务路由 (Webhook)
+      // 6️⃣ 处理业务路由 (Webhook)
       if (url.pathname === "/webhook") {
         return await handleWebhook(request, kv);
       }
@@ -50,7 +53,56 @@ export default {
 };
 
 /**
- * Docker Registry 代理逻辑 - 修复版本
+ * 连通性测试接口
+ */
+async function handleConnectivityTest(request, kv) {
+  const registry = await kv.get("ALIYUN_REGISTRY");
+  if (!registry) {
+    return jsonResponse({ error: "ALIYUN_REGISTRY not configured" }, 500);
+  }
+
+  const testUrl = `https://${registry}/v2/`;
+  
+  try {
+    console.log("Testing connectivity to:", testUrl);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+    
+    const response = await fetch(testUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+      }
+    });
+    
+    clearTimeout(timeoutId);
+    
+    console.log("Connectivity test result:", response.status);
+    
+    return jsonResponse({
+      registry: registry,
+      test_url: testUrl,
+      status: response.status,
+      status_text: response.statusText,
+      success: response.ok,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("Connectivity test failed:", error);
+    return jsonResponse({
+      registry: registry,
+      test_url: testUrl,
+      error: error.message,
+      success: false,
+      timestamp: new Date().toISOString()
+    }, 500);
+  }
+}
+
+/**
+ * Docker Registry 代理逻辑 - 增强版
  */
 async function handleRegistry(request, kv) {
   const url = new URL(request.url);
@@ -92,9 +144,13 @@ async function handleRegistry(request, kv) {
 
   const targetUrl = new URL(`https://${targetHost}${targetPath}${url.search}`);
 
+  console.log("=== REGISTRY REQUEST DEBUG ===");
   console.log("Original path:", url.pathname);
   console.log("Target path:", targetPath);
   console.log("Target URL:", targetUrl.toString());
+  console.log("Method:", request.method);
+  console.log("Headers:", [...request.headers.entries()]);
+  console.log("=============================");
 
   const headers = new Headers(request.headers);
   headers.set("Host", targetHost);
@@ -111,7 +167,18 @@ async function handleRegistry(request, kv) {
 
   // 向阿里云发起请求
   try {
-    const response = await fetch(targetUrl, fetchInit);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒超时
+    
+    const response = await fetch(targetUrl, {
+      ...fetchInit,
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    console.log("Upstream response status:", response.status);
+    
     const proxyResponse = new Response(response.body, response);
 
     // 处理 401 鉴权
@@ -124,6 +191,8 @@ async function handleRegistry(request, kv) {
           const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}`;
           const newAuthHeader = authHeader.replace(originalRealm, newRealm);
           proxyResponse.headers.set("Www-Authenticate", newAuthHeader);
+          
+          console.log("Modified WWW-Authenticate header:", newAuthHeader);
         }
       }
     }
@@ -132,12 +201,15 @@ async function handleRegistry(request, kv) {
     return proxyResponse;
   } catch (error) {
     console.error("Fetch error:", error);
+    if (error.name === 'AbortError') {
+      return jsonResponse({ error: "Upstream request timed out" }, 504);
+    }
     return jsonResponse({ error: `Upstream request failed: ${error.message}` }, 502);
   }
 }
 
 /**
- * 代理获取 Token - 修复版本
+ * 代理获取 Token - 增强版
  */
 async function handleAuth(request, kv) {
   const url = new URL(request.url);
@@ -156,7 +228,10 @@ async function handleAuth(request, kv) {
     }
   });
 
-  console.log("Auth request to:", upstreamUrl.toString());
+  console.log("=== AUTH REQUEST DEBUG ===");
+  console.log("Upstream realm:", upstreamRealm);
+  console.log("Final auth URL:", upstreamUrl.toString());
+  console.log("=========================");
 
   // 并发读取账号密码
   const [user, pass] = await Promise.all([
@@ -177,12 +252,17 @@ async function handleAuth(request, kv) {
   headers.set("Authorization", `Basic ${authStr}`);
 
   try {
-    // 去阿里云获取 Token
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+    
     const tokenRes = await fetch(upstreamUrl.toString(), {
       method: "GET",
-      headers: headers
+      headers: headers,
+      signal: controller.signal
     });
 
+    clearTimeout(timeoutId);
+    
     console.log("Auth response status:", tokenRes.status);
 
     if (!tokenRes.ok) {
@@ -196,6 +276,9 @@ async function handleAuth(request, kv) {
     return proxyTokenRes;
   } catch (error) {
     console.error("Auth request error:", error);
+    if (error.name === 'AbortError') {
+      return jsonResponse({ error: "Auth request timed out" }, 504);
+    }
     return jsonResponse({ error: `Auth request failed: ${error.message}` }, 502);
   }
 }
@@ -227,11 +310,19 @@ async function handleDebug(request, kv) {
   if (!config.ALIYUN_REGISTRY) missing.push('ALIYUN_REGISTRY');
   if (!config.ALIYUN_REGISTRY_USER) missing.push('ALIYUN_REGISTRY_USER');
   
+  // 获取最近的日志
+  const logs = [];
+  // 这里不能直接访问日志，但我们可以通过返回配置来帮助调试
+  
   return jsonResponse({
     config,
     missingConfig: missing,
     timestamp: new Date().toISOString(),
-    status: missing.length === 0 ? 'OK' : 'CONFIG_ERROR'
+    status: missing.length === 0 ? 'OK' : 'CONFIG_ERROR',
+    instructions: {
+      test_connectivity: "GET /test-connectivity to test registry connection",
+      check_logs: "Use Cloudflare Dashboard Logs tab for real-time logs"
+    }
   });
 }
 
