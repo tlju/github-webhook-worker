@@ -2,12 +2,6 @@ name = "github-webhook-worker"
 main = "src/index.js"
 compatibility_date = "2026-02-27"
 
-[vars]
-GITHUB_OWNER = "tlju"
-GITHUB_REPO = "docker_image_pusher"
-BRANCH = "main"
-FILE_PATH = "images.txt"
-
 [observability]
 enabled = false
 head_sampling_rate = 1
