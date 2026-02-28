@@ -123,7 +123,7 @@ async function handleWebhook(request, env) {
   const valid = await verifySignature(
     rawBody,
     signature,
-    env.WEBHOOK_SECRET
+    env.KV.get('WEBHOOK_SECRET')
   );
 
   if (!valid) {
@@ -153,7 +153,7 @@ async function safeGitHubRequest(url, env, options = {}) {
   const response = await fetch(url, {
     ...options,
     headers: {
-      Authorization: `Bearer ${env.GH_TOKEN}`,
+      Authorization: `Bearer ${env.KV.get('GH_TOKEN')}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
       "User-Agent": "cloudflare-worker",
