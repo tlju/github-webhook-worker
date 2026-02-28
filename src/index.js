@@ -47,34 +47,44 @@ async function handleRegistry(request) {
   const registryHeaders = {
     "Content-Type": "application/json",
     "Docker-Distribution-API-Version": "registry/2.0",
-    "Access-Control-Allow-Origin": "*", // 增加跨域支持
+    "Access-Control-Allow-Origin": "*",
   };
 
-  // 1. 快速响应版本检查 (GET 或 HEAD)
-  if (url.pathname === "/v2/" || url.pathname === "/v2") {
+  const path = url.pathname;
+
+  // 1. 核心改进：更标准的版本探测响应
+  if (path === "/v2" || path === "/v2/") {
     return new Response(JSON.stringify({}), { 
       status: 200, 
-      headers: registryHeaders 
+      headers: {
+        ...registryHeaders,
+        // 关键点：有些 Docker 版本要求这个头来确定认证方式
+        "Www-Authenticate": "Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\"",
+        "Cache-Control": "no-cache"
+      } 
     });
   }
 
-  // 2. 捕获所有镜像相关请求
-  // 必须确保响应足够快，否则 Docker 客户端会认为镜像仓库已挂掉
+  // 2. 针对所有镜像拉取路径，触发 429 重试
+  // 确保处理 HEAD 请求，Docker 经常先发 HEAD
   const errorPayload = {
     errors: [{ 
-      code: "TOOMANYREQUESTS", // 使用更标准的 Docker 错误码
+      code: "TOOMANYREQUESTS", 
       message: "Simulated retry by Cloudflare Worker",
       detail: { "retry_after": 5 }
     }],
   };
 
-  return new Response(JSON.stringify(errorPayload), {
-    status: 429,
-    headers: {
-      ...registryHeaders,
-      "Retry-After": "5", 
-    },
-  });
+  return new Response(
+    request.method === "HEAD" ? null : JSON.stringify(errorPayload), 
+    {
+      status: 429,
+      headers: {
+        ...registryHeaders,
+        "Retry-After": "5", 
+      },
+    }
+  );
 }
 
 /**
