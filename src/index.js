@@ -12,8 +12,6 @@ export default {
     }
 
     try {
-      console.log("Incoming request:", request.method, url.pathname);
-      
       // 1️⃣ 处理 Docker Token 鉴权代理
       if (url.pathname === "/v2/auth") {
         return await handleAuth(request, kv);
@@ -24,22 +22,32 @@ export default {
         return await handleRegistry(request, kv);
       }
 
-      // 3️⃣ 调试接口 - 显示当前配置和测试连接
+      // 3️⃣ 调试接口
       if (url.pathname === "/debug") {
         return await handleDebug(request, kv);
       }
 
-      // 4️⃣ 连通性测试接口
+      // 4️⃣ 连通性测试接口 - 支持带认证的测试
       if (url.pathname === "/test-connectivity") {
         return await handleConnectivityTest(request, kv);
       }
 
-      // 5️⃣ 处理业务路由 (GitHub 更新)
+      // 5️⃣ 认证测试接口
+      if (url.pathname === "/test-auth") {
+        return await handleAuthTest(request, kv);
+      }
+
+      // 6️⃣ 镜像列表测试
+      if (url.pathname === "/test-image-list") {
+        return await handleImageListTest(request, kv);
+      }
+
+      // 7️⃣ 处理业务路由 (GitHub 更新)
       if (url.pathname === "/update") {
         return await handleUpdate(request, kv);
       }
 
-      // 6️⃣ 处理业务路由 (Webhook)
+      // 8️⃣ 处理业务路由 (Webhook)
       if (url.pathname === "/webhook") {
         return await handleWebhook(request, kv);
       }
@@ -53,7 +61,7 @@ export default {
 };
 
 /**
- * 连通性测试接口
+ * 连通性测试接口 - 增强版
  */
 async function handleConnectivityTest(request, kv) {
   const registry = await kv.get("ALIYUN_REGISTRY");
@@ -64,10 +72,10 @@ async function handleConnectivityTest(request, kv) {
   const testUrl = `https://${registry}/v2/`;
   
   try {
-    console.log("Testing connectivity to:", testUrl);
+    console.log("Testing basic connectivity to:", testUrl);
     
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     
     const response = await fetch(testUrl, {
       method: 'GET',
@@ -79,14 +87,15 @@ async function handleConnectivityTest(request, kv) {
     
     clearTimeout(timeoutId);
     
-    console.log("Connectivity test result:", response.status);
+    const authHeader = response.headers.get("WWW-Authenticate");
     
     return jsonResponse({
       registry: registry,
       test_url: testUrl,
       status: response.status,
       status_text: response.statusText,
-      success: response.ok,
+      success: response.status === 401, // 401 是预期的，表示连接成功但需要认证
+      www_authenticate: authHeader,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -102,7 +111,140 @@ async function handleConnectivityTest(request, kv) {
 }
 
 /**
- * Docker Registry 代理逻辑 - 增强版
+ * 认证测试接口 - 测试是否可以成功获取认证token
+ */
+async function handleAuthTest(request, kv) {
+  const registry = await kv.get("ALIYUN_REGISTRY");
+  if (!registry) {
+    return jsonResponse({ error: "ALIYUN_REGISTRY not configured" }, 500);
+  }
+
+  const user = await kv.get("ALIYUN_REGISTRY_USER");
+  const pass = await kv.get("ALIYUN_REGISTRY_PASSWORD");
+  
+  if (!user || !pass) {
+    return jsonResponse({ error: "Credentials not configured" }, 500);
+  }
+
+  // 构建认证URL - 阿里云的认证端点通常在同一个域名下
+  const authUrl = `https://${registry}/tokens`;
+
+  try {
+    console.log("Testing authentication to:", authUrl);
+    
+    const authStr = btoa(`${user}:${pass}`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(authUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Basic ${authStr}`,
+      }
+    });
+    
+    clearTimeout(timeoutId);
+    
+    const responseBody = await response.text();
+    let jsonData;
+    try {
+      jsonData = JSON.parse(responseBody);
+    } catch (e) {
+      jsonData = { raw_response: responseBody };
+    }
+    
+    return jsonResponse({
+      auth_url: authUrl,
+      status: response.status,
+      status_text: response.statusText,
+      success: response.ok,
+      response: jsonData,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("Auth test failed:", error);
+    return jsonResponse({
+      auth_url: authUrl,
+      error: error.message,
+      success: false,
+      timestamp: new Date().toISOString()
+    }, 500);
+  }
+}
+
+/**
+ * 镜像列表测试 - 测试具体镜像是否存在
+ */
+async function handleImageListTest(request, kv) {
+  const registry = await kv.get("ALIYUN_REGISTRY");
+  const namespace = await kv.get("TARGET_NAMESPACE") || "tlju-docker-images";
+  if (!registry) {
+    return jsonResponse({ error: "ALIYUN_REGISTRY not configured" }, 500);
+  }
+
+  const user = await kv.get("ALIYUN_REGISTRY_USER");
+  const pass = await kv.get("ALIYUN_REGISTRY_PASSWORD");
+  
+  if (!user || !pass) {
+    return jsonResponse({ error: "Credentials not configured" }, 500);
+  }
+
+  // 测试特定镜像 - 例如测试 python 镜像
+  const testImage = `${namespace}/python`;
+  const testUrl = `https://${registry}/v2/${testImage}/tags/list`;
+  
+  try {
+    console.log("Testing image existence:", testUrl);
+    
+    const authStr = btoa(`${user}:${pass}`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(testUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Basic ${authStr}`,
+      }
+    });
+    
+    clearTimeout(timeoutId);
+    
+    const responseBody = await response.text();
+    let jsonData;
+    try {
+      jsonData = JSON.parse(responseBody);
+    } catch (e) {
+      jsonData = { raw_response: responseBody };
+    }
+    
+    return jsonResponse({
+      test_image: testImage,
+      test_url: testUrl,
+      status: response.status,
+      status_text: response.statusText,
+      success: response.ok,
+      response: jsonData,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("Image list test failed:", error);
+    return jsonResponse({
+      test_image: testImage,
+      error: error.message,
+      success: false,
+      timestamp: new Date().toISOString()
+    }, 500);
+  }
+}
+
+/**
+ * Docker Registry 代理逻辑 - 正确版本
  */
 async function handleRegistry(request, kv) {
   const url = new URL(request.url);
@@ -118,28 +260,72 @@ async function handleRegistry(request, kv) {
 
   let targetPath = url.pathname;
 
-  // 路径重写逻辑
-  if (targetPath !== "/v2/" && targetPath !== "/v2") {
-    const match = targetPath.match(/^\/v2\/(.+)\/(manifests|blobs)\/(.+)$/);
-    if (match) {
-      const originalRepo = match[1];
-      const action = match[2];
-      const reference = match[3];
+  // 特殊处理根路径
+  if (targetPath === "/v2/" || targetPath === "/v2") {
+    // 对于根路径，我们仍然需要处理认证
+    const targetUrl = new URL(`https://${targetHost}${targetPath}${url.search}`);
+    
+    console.log("Root path request - need to handle auth challenge");
+    
+    const headers = new Headers(request.headers);
+    headers.set("Host", targetHost);
 
-      // 从原始仓库名提取镜像名
-      const parts = originalRepo.split('/');
-      let imageName = originalRepo; // 默认使用完整路径
-      
-      // 如果是 library/ 前缀，则只取最后一部分
-      if (originalRepo.startsWith('library/')) {
-        imageName = parts[parts.length - 1];
-      } else {
-        // 如果包含多个部分，用连字符连接
-        imageName = parts.join('-');
-      }
-      
-      targetPath = `/v2/${targetNamespace}/${imageName}/${action}/${reference}`;
+    const fetchInit = {
+      method: request.method,
+      headers: headers,
+      redirect: "manual", 
+    };
+
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      fetchInit.body = request.body;
     }
+
+    try {
+      const response = await fetch(targetUrl, fetchInit);
+      const proxyResponse = new Response(response.body, response);
+
+      // 处理 401 鉴权
+      if (proxyResponse.status === 401) {
+        const authHeader = proxyResponse.headers.get("Www-Authenticate");
+        if (authHeader && authHeader.startsWith("Bearer ")) {
+          const realmMatch = authHeader.match(/realm="([^"]+)"/);
+          if (realmMatch) {
+            const originalRealm = realmMatch[1];
+            const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}`;
+            const newAuthHeader = authHeader.replace(originalRealm, newRealm);
+            proxyResponse.headers.set("Www-Authenticate", newAuthHeader);
+          }
+        }
+      }
+
+      proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
+      return proxyResponse;
+    } catch (error) {
+      console.error("Root path fetch error:", error);
+      return jsonResponse({ error: `Upstream request failed: ${error.message}` }, 502);
+    }
+  }
+
+  // 路径重写逻辑
+  const match = targetPath.match(/^\/v2\/(.+)\/(manifests|blobs)\/(.+)$/);
+  if (match) {
+    const originalRepo = match[1];
+    const action = match[2];
+    const reference = match[3];
+
+    // 从原始仓库名提取镜像名
+    const parts = originalRepo.split('/');
+    let imageName = originalRepo; // 默认使用完整路径
+    
+    // 如果是 library/ 前缀，则只取最后一部分
+    if (originalRepo.startsWith('library/')) {
+      imageName = parts[parts.length - 1];
+    } else {
+      // 如果包含多个部分，用连字符连接
+      imageName = parts.join('-');
+    }
+    
+    targetPath = `/v2/${targetNamespace}/${imageName}/${action}/${reference}`;
   }
 
   const targetUrl = new URL(`https://${targetHost}${targetPath}${url.search}`);
@@ -149,7 +335,6 @@ async function handleRegistry(request, kv) {
   console.log("Target path:", targetPath);
   console.log("Target URL:", targetUrl.toString());
   console.log("Method:", request.method);
-  console.log("Headers:", [...request.headers.entries()]);
   console.log("=============================");
 
   const headers = new Headers(request.headers);
@@ -167,18 +352,7 @@ async function handleRegistry(request, kv) {
 
   // 向阿里云发起请求
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒超时
-    
-    const response = await fetch(targetUrl, {
-      ...fetchInit,
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    
-    console.log("Upstream response status:", response.status);
-    
+    const response = await fetch(targetUrl, fetchInit);
     const proxyResponse = new Response(response.body, response);
 
     // 处理 401 鉴权
@@ -188,11 +362,9 @@ async function handleRegistry(request, kv) {
         const realmMatch = authHeader.match(/realm="([^"]+)"/);
         if (realmMatch) {
           const originalRealm = realmMatch[1];
-          const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}`;
+          const newRealm = `https://${url.host}/v2/auth?upstream_realm=${encodeURIComponent(originalRealm)}&service=${encodeURIComponent(url.searchParams.get('service') || '')}&scope=${encodeURIComponent(url.searchParams.get('scope') || '')}`;
           const newAuthHeader = authHeader.replace(originalRealm, newRealm);
           proxyResponse.headers.set("Www-Authenticate", newAuthHeader);
-          
-          console.log("Modified WWW-Authenticate header:", newAuthHeader);
         }
       }
     }
@@ -201,15 +373,12 @@ async function handleRegistry(request, kv) {
     return proxyResponse;
   } catch (error) {
     console.error("Fetch error:", error);
-    if (error.name === 'AbortError') {
-      return jsonResponse({ error: "Upstream request timed out" }, 504);
-    }
     return jsonResponse({ error: `Upstream request failed: ${error.message}` }, 502);
   }
 }
 
 /**
- * 代理获取 Token - 增强版
+ * 代理获取 Token - 改进版
  */
 async function handleAuth(request, kv) {
   const url = new URL(request.url);
@@ -222,14 +391,18 @@ async function handleAuth(request, kv) {
 
   // 重组请求阿里云的 URL
   const upstreamUrl = new URL(upstreamRealm);
-  url.searchParams.forEach((value, key) => {
-    if (key !== "upstream_realm") {
-      upstreamUrl.searchParams.append(key, value);
-    }
-  });
+  
+  // 保留原始参数
+  const service = url.searchParams.get("service") || "";
+  const scope = url.searchParams.get("scope") || "";
+  
+  if (service) upstreamUrl.searchParams.set("service", service);
+  if (scope) upstreamUrl.searchParams.set("scope", scope);
 
   console.log("=== AUTH REQUEST DEBUG ===");
   console.log("Upstream realm:", upstreamRealm);
+  console.log("Service:", service);
+  console.log("Scope:", scope);
   console.log("Final auth URL:", upstreamUrl.toString());
   console.log("=========================");
 
@@ -252,17 +425,11 @@ async function handleAuth(request, kv) {
   headers.set("Authorization", `Basic ${authStr}`);
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
-    
     const tokenRes = await fetch(upstreamUrl.toString(), {
       method: "GET",
-      headers: headers,
-      signal: controller.signal
+      headers: headers
     });
 
-    clearTimeout(timeoutId);
-    
     console.log("Auth response status:", tokenRes.status);
 
     if (!tokenRes.ok) {
@@ -276,9 +443,6 @@ async function handleAuth(request, kv) {
     return proxyTokenRes;
   } catch (error) {
     console.error("Auth request error:", error);
-    if (error.name === 'AbortError') {
-      return jsonResponse({ error: "Auth request timed out" }, 504);
-    }
     return jsonResponse({ error: `Auth request failed: ${error.message}` }, 502);
   }
 }
@@ -310,18 +474,16 @@ async function handleDebug(request, kv) {
   if (!config.ALIYUN_REGISTRY) missing.push('ALIYUN_REGISTRY');
   if (!config.ALIYUN_REGISTRY_USER) missing.push('ALIYUN_REGISTRY_USER');
   
-  // 获取最近的日志
-  const logs = [];
-  // 这里不能直接访问日志，但我们可以通过返回配置来帮助调试
-  
   return jsonResponse({
     config,
     missingConfig: missing,
     timestamp: new Date().toISOString(),
     status: missing.length === 0 ? 'OK' : 'CONFIG_ERROR',
-    instructions: {
-      test_connectivity: "GET /test-connectivity to test registry connection",
-      check_logs: "Use Cloudflare Dashboard Logs tab for real-time logs"
+    test_urls: {
+      connectivity: "GET /test-connectivity",
+      auth: "GET /test-auth", 
+      images: "GET /test-image-list",
+      logs: "Check Cloudflare Dashboard Logs tab for real-time logs"
     }
   });
 }
