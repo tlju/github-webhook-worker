@@ -50,44 +50,44 @@ async function handleRegistry(request) {
     "Access-Control-Allow-Origin": "*",
   };
 
-  const method = request.method;
   const path = url.pathname;
 
-  // 1. 响应 Docker 的 Ping 请求 (GET /v2/)
-  // 必须返回 200，且包含 Docker 版本头
-  if (path === "/v2/" || path === "/v2") {
+  // 1️⃣ 处理版本探测 (必须极其稳定且快速)
+  // Docker 启动拉取任务前会先访问这里，如果这里返回 429，它可能直接跳过该加速器
+  if (path === "/v2" || path === "/v2/") {
     return new Response(JSON.stringify({}), { 
       status: 200, 
       headers: {
         ...registryHeaders,
-        // 添加认证挑战，告诉 Docker 这里是一个标准的 Registry，但需要验证（这是为了提高可信度）
-        "Www-Authenticate": "Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\""
+        "Www-Authenticate": "Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\"",
+        "Cache-Control": "public, max-age=3600" // 建议缓存，增加稳定性感
       } 
     });
   }
 
-  // 2. 模拟重试逻辑
-  // Docker 在执行 manifest 检查时会发送 HEAD 请求，这里必须返回 200 或 429 对应的 Header
+  // 2️⃣ 处理 Manifest/Blobs 请求
+  // 仅在请求具体的镜像资源时返回重试指令
   const errorPayload = {
-    errors: [{ 
-      code: "TOOMANYREQUESTS", 
-      message: "Simulated retry by Cloudflare Worker",
-      detail: { "retry_after": 5 }
-    }],
+    errors: [
+      { 
+        code: "TOOMANYREQUESTS", 
+        message: "Rate limit exceeded. Please retry.",
+        detail: { "retry_after": 5 }
+      }
+    ],
   };
 
-  // 关键优化：如果是 HEAD 请求，只返回 Header，不返回 Body，这是符合 Docker Registry 规范的
-  if (method === "HEAD") {
-    return new Response(null, {
-      status: 429,
-      headers: { ...registryHeaders, "Retry-After": "5" }
-    });
-  }
-
-  return new Response(JSON.stringify(errorPayload), {
-    status: 429,
-    headers: { ...registryHeaders, "Retry-After": "5" },
-  });
+  // 重点：有些 Docker 版本对 429 敏感，如果 429 导致它回退，可以尝试改成 503
+  return new Response(
+    request.method === "HEAD" ? null : JSON.stringify(errorPayload), 
+    {
+      status: 429, 
+      headers: {
+        ...registryHeaders,
+        "Retry-After": "5", 
+      },
+    }
+  );
 }
 
 /**
