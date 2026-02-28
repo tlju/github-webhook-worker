@@ -47,20 +47,24 @@ async function handleRegistry(request) {
   const registryHeaders = {
     "Content-Type": "application/json",
     "Docker-Distribution-API-Version": "registry/2.0",
+    "Access-Control-Allow-Origin": "*", // 增加跨域支持
   };
 
-  // Docker 首次握手检查，必须返回 200
+  // 1. 快速响应版本检查 (GET 或 HEAD)
   if (url.pathname === "/v2/" || url.pathname === "/v2") {
-    return new Response(JSON.stringify({}), { status: 200, headers: registryHeaders });
+    return new Response(JSON.stringify({}), { 
+      status: 200, 
+      headers: registryHeaders 
+    });
   }
 
-  // 模拟触发重试：返回 429 (Too Many Requests)
-  // Docker 看到 429 且有 Retry-After 时会进入等待重试逻辑
+  // 2. 捕获所有镜像相关请求
+  // 必须确保响应足够快，否则 Docker 客户端会认为镜像仓库已挂掉
   const errorPayload = {
     errors: [{ 
-      code: "UNAVAILABLE", 
-      message: "Server busy, retrying via Cloudflare Worker",
-      detail: "This is a simulated retry trigger."
+      code: "TOOMANYREQUESTS", // 使用更标准的 Docker 错误码
+      message: "Simulated retry by Cloudflare Worker",
+      detail: { "retry_after": 5 }
     }],
   };
 
@@ -68,7 +72,7 @@ async function handleRegistry(request) {
     status: 429,
     headers: {
       ...registryHeaders,
-      "Retry-After": "5", // 告知 Docker 5 秒后重试
+      "Retry-After": "5", 
     },
   });
 }
