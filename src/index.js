@@ -1,24 +1,28 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    // 注意：如果你的绑定名包含横杠，需使用 env["docker-image-pusher"] 这种写法
-    const kv = env["docker-image-pusher"];
+    // 获取 KV 绑定
+    const kv = env.DOCKER_KV;
 
     if (!kv) {
-      return jsonResponse({ error: "KV binding 'docker-image-pusher' not found." }, 500);
+      return jsonResponse({ 
+        error: "KV 绑定 'DOCKER_KV' 未找到", 
+        detail: "请检查 Worker 控制台的 Settings -> Variables -> KV Namespace Bindings，确保 Variable name 为 DOCKER_KV" 
+      }, 500);
     }
 
     try {
-      // 1. Docker Registry 路由 (无需 KV 配置即可运行，仅作重试触发)
+      // 1. Docker Registry 路由 (触发 Docker pull 重试)
       if (url.pathname.startsWith("/v2/")) {
         return await handleRegistry(request);
       }
 
-      // 2. 业务路由
+      // 2. 更新 GitHub 文件接口
       if (url.pathname === "/update") {
         return await handleUpdate(request, kv);
       }
 
+      // 3. Webhook 接收接口
       if (url.pathname === "/webhook") {
         return await handleWebhook(request, kv);
       }
@@ -31,7 +35,7 @@ export default {
 };
 
 //////////////////////////////////////////////////////
-// Docker Registry 逻辑 (触发 429 重试)
+// Docker Registry 模拟逻辑 (触发 429 重试)
 //////////////////////////////////////////////////////
 async function handleRegistry(request) {
   const url = new URL(request.url);
@@ -40,24 +44,31 @@ async function handleRegistry(request) {
     "Docker-Distribution-API-Version": "registry/2.0",
   };
 
+  // 响应版本检查 (GET /v2/)，必须返回 200 以引导 Docker 继续请求
   if (url.pathname === "/v2/" || url.pathname === "/v2") {
     return new Response(JSON.stringify({}), { status: 200, headers: registryHeaders });
   }
 
-  // 返回 429 强制 Docker 客户端重试
-  return new Response(
-    JSON.stringify({
-      errors: [{ code: "UNAVAILABLE", message: "Triggering Docker Retry" }]
-    }),
-    {
-      status: 429,
-      headers: { ...registryHeaders, "Retry-After": "5" },
-    }
-  );
+  // 响应具体拉取请求，返回 429 触发重试逻辑
+  const errorPayload = {
+    errors: [{
+      code: "UNAVAILABLE",
+      message: "Server busy, retrying in 5s...",
+      detail: "Triggered by Cloudflare Worker"
+    }]
+  };
+
+  return new Response(JSON.stringify(errorPayload), {
+    status: 429,
+    headers: {
+      ...registryHeaders,
+      "Retry-After": "5" // 告诉 Docker 5 秒后重试
+    },
+  });
 }
 
 //////////////////////////////////////////////////////
-// 更新文件接口 (使用 Promise.all 并发读取 KV)
+// 更新文件接口 (从 KV 获取配置)
 //////////////////////////////////////////////////////
 async function handleUpdate(request, kv) {
   if (request.method !== "POST") {
@@ -69,7 +80,7 @@ async function handleUpdate(request, kv) {
     return jsonResponse({ error: "Missing content" }, 400);
   }
 
-  // 🚀 并发读取所有配置，减少等待时间
+  // 🚀 并发从 KV 获取所有配置，大幅提升响应速度
   const [owner, repo, filePath, branch, token] = await Promise.all([
     kv.get("GITHUB_OWNER"),
     kv.get("GITHUB_REPO"),
@@ -79,14 +90,18 @@ async function handleUpdate(request, kv) {
   ]);
 
   if (!owner || !repo || !token) {
-    throw new Error("Missing KV config: GITHUB_OWNER, GITHUB_REPO, or GH_TOKEN");
+    throw new Error("KV 配置缺失，请检查 GITHUB_OWNER, GITHUB_REPO, GH_TOKEN 是否在 KV 中");
   }
 
-  // 1️⃣ 获取文件当前 SHA
+  // 1️⃣ 获取目标文件当前的 SHA (GitHub API 要求)
   const fileData = await safeGitHubRequest(
     `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`,
     token
   );
+
+  if (!fileData.sha) {
+    throw new Error("无法获取文件 SHA，请确认文件路径及 Token 权限是否正确");
+  }
 
   // 2️⃣ 提交更新
   const updateResult = await safeGitHubRequest(
@@ -95,7 +110,7 @@ async function handleUpdate(request, kv) {
     {
       method: "PUT",
       body: JSON.stringify({
-        message: `auto update ${filePath} via worker`,
+        message: `auto update ${filePath} via Cloudflare Worker`,
         content: base64Encode(body.content),
         sha: fileData.sha,
         branch: branch,
@@ -103,7 +118,10 @@ async function handleUpdate(request, kv) {
     }
   );
 
-  return jsonResponse({ message: "Update success", commit: updateResult.commit?.sha });
+  return jsonResponse({
+    message: "Update success",
+    commit: updateResult.commit?.sha
+  });
 }
 
 //////////////////////////////////////////////////////
@@ -126,14 +144,15 @@ async function handleWebhook(request, kv) {
       workflow: payload.workflow_run.name,
       status: payload.workflow_run.status,
       conclusion: payload.workflow_run.conclusion,
+      commit: payload.workflow_run.head_sha
     });
   }
 
-  return jsonResponse({ message: "Ignored" });
+  return jsonResponse({ message: "Ignored event" });
 }
 
 //////////////////////////////////////////////////////
-// 工具函数 (现代化与安全封装)
+// 工具函数封装
 //////////////////////////////////////////////////////
 
 async function safeGitHubRequest(url, token, options = {}) {
@@ -143,20 +162,28 @@ async function safeGitHubRequest(url, token, options = {}) {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "User-Agent": "cf-worker-pusher",
+      "User-Agent": "cf-worker-registry-pusher",
       ...(options.headers || {}),
     },
   });
 
-  const data = await response.json().catch(() => ({}));
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`GitHub 非 JSON 响应: ${text}`);
+  }
+
   if (!response.ok) {
-    throw new Error(`GitHub Error ${response.status}: ${JSON.stringify(data)}`);
+    throw new Error(`GitHub API Error ${response.status}: ${JSON.stringify(data)}`);
   }
   return data;
 }
 
 async function safeParseRequestJSON(request) {
-  try { return await request.json(); } 
+  const text = await request.text();
+  try { return JSON.parse(text); } 
   catch { throw new Error("Invalid JSON body"); }
 }
 
@@ -173,6 +200,9 @@ async function verifySignature(body, signature, secret) {
   return `sha256=${hash}` === signature;
 }
 
+/**
+ * 现代化的 Base64 编码，安全支持 UTF-8 (中文)
+ */
 function base64Encode(str) {
   const bytes = new TextEncoder().encode(str);
   const binString = Array.from(bytes, byte => String.fromCharCode(byte)).join("");
