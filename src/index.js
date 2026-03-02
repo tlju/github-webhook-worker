@@ -259,15 +259,21 @@ async function safeGitHubRequest(url, token, options = {}) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
       ...(options.headers || {})
     }
   });
 
-  const data = await response.json();
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("GitHub returned non-JSON: " + text);
+  }
 
   if (!response.ok) {
-    throw new Error(JSON.stringify(data));
+    throw new Error("GitHub error: " + JSON.stringify(data));
   }
 
   return data;
