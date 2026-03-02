@@ -4,7 +4,7 @@ export default {
     const kv = env.DOCKER_KV;
 
     if (!kv) {
-      return new Response("KV not bound", { status: 500 });
+      return new Response("KV 绑定错误：请确保在 Cloudflare 设置中绑定了名为 DOCKER_KV 的命名空间", { status: 500 });
     }
 
     try {
@@ -32,16 +32,26 @@ export default {
         return handleWebhook(request, kv);
       }
 
+      // 根目录自动跳转到 /ui
+      if (url.pathname === "/") {
+        return Response.redirect(`${url.origin}/ui`, 302);
+      }
+
       return new Response("Not Found", { status: 404 });
 
     } catch (err) {
-      return json({ error: err.message }, 500);
+      // 捕获所有未处理异常，防止 1101 错误
+      return json({ 
+        error: "Worker 内部错误", 
+        message: err.message,
+        stack: err.stack 
+      }, 500);
     }
   }
 };
 
 //////////////////////////////////////////////////////
-// 登录逻辑
+// 登录与鉴权逻辑
 //////////////////////////////////////////////////////
 
 async function handleLogin(request, kv) {
@@ -59,6 +69,10 @@ async function handleLogin(request, kv) {
     kv.get("SESSION_SECRET")
   ]);
 
+  if (!kvUser || !kvPass || !secret) {
+    return loginPage("系统未初始化：请在 KV 中设置 UI_USERNAME, UI_PASSWORD 和 SESSION_SECRET");
+  }
+
   if (username === kvUser && password === kvPass) {
     const token = await signValue(username, secret);
 
@@ -66,7 +80,7 @@ async function handleLogin(request, kv) {
       status: 302,
       headers: {
         "Location": "/ui",
-        "Set-Cookie": `session=${token}; HttpOnly; Path=/; SameSite=Strict`
+        "Set-Cookie": `session=${token}; HttpOnly; Path=/; SameSite=Strict; Secure`
       }
     });
   }
@@ -91,61 +105,94 @@ async function isAuthenticated(request, kv) {
 
   const token = match[1];
   const secret = await kv.get("SESSION_SECRET");
+  if (!secret) return false;
+  
   return verifyValue(token, secret);
 }
 
 //////////////////////////////////////////////////////
-// UI 页面
+// UI 页面 (HTML)
 //////////////////////////////////////////////////////
 
 async function uiPage(kv) {
   const lastWorkflow = await kv.get("LAST_WORKFLOW");
+  const filePath = await kv.get("FILE_PATH") || "未设置";
 
   return html(`
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Docker 控制台</title>
 <style>
-body{font-family:system-ui;background:#f4f6fb;padding:30px}
-.card{background:#fff;padding:20px;border-radius:12px;max-width:750px;margin:auto;box-shadow:0 10px 30px rgba(0,0,0,.05)}
-textarea{width:100%;height:120px;border:1px solid #ddd;border-radius:8px;padding:8px;font-family:monospace}
-button{padding:8px 16px;border:none;border-radius:8px;background:#5562ff;color:white;cursor:pointer}
-pre{background:#f2f2f7;padding:12px;border-radius:8px}
-.status{margin-top:10px}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#f4f6fb;padding:20px;color:#333}
+  .card{background:#fff;padding:24px;border-radius:12px;max-width:800px;margin:auto;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+  h2{margin-top:0;color:#1a1a1a}
+  textarea{width:100%;height:180px;border:1px solid #ddd;border-radius:8px;padding:12px;font-family:monospace;box-sizing:border-box;font-size:14px;background:#fafafa}
+  textarea:focus{outline:2px solid #5562ff;border-color:transparent}
+  .actions{margin-top:15px;display:flex;justify-content:space-between;align-items:center}
+  button{padding:10px 24px;border:none;border-radius:8px;background:#5562ff;color:white;cursor:pointer;font-weight:600;transition:background 0.2s}
+  button:hover{background:#3e49df}
+  button:disabled{background:#ccc;cursor:not-allowed}
+  pre{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;overflow-x:auto;font-size:13px}
+  .label{font-weight:bold;margin-bottom:8px;display:block}
+  .status-tag{padding:4px 8px;border-radius:4px;font-size:12px;background:#eee}
 </style>
 </head>
 <body>
 <div class="card">
-<h2>Docker 镜像更新</h2>
+  <h2>Docker 镜像更新 <span class="status-tag">${filePath}</span></h2>
+  
+  <label class="label">输入新的配置内容 (如 python:3.11-slim):</label>
+  <textarea id="content" placeholder="输入内容会直接覆盖文件..."></textarea>
+  
+  <div class="actions">
+    <button id="submitBtn" onclick="submitUpdate()">提交到 GitHub</button>
+    <a href="/logout" style="color:#666;text-decoration:none;font-size:14px">退出登录</a>
+  </div>
 
-<textarea id="content" placeholder="例如：&#10;python:3.11-slim"></textarea>
-<br><br>
-<button onclick="submitUpdate()">提交</button>
-<a href="/logout" style="float:right">退出登录</a>
+  <h3>最近 Workflow 状态</h3>
+  <pre id="workflowStatus">${lastWorkflow || "暂无记录"}</pre>
 
-<h3>最近 Workflow 状态</h3>
-<pre class="status">${lastWorkflow || "暂无记录"}</pre>
-
-<h3>提交结果</h3>
-<pre id="result">尚未提交</pre>
+  <h3>操作日志</h3>
+  <pre id="result">等待提交...</pre>
 </div>
 
 <script>
 async function submitUpdate(){
+  const btn = document.getElementById("submitBtn");
   const content = document.getElementById("content").value.trim();
+  const resBox = document.getElementById("result");
+
   if(!content){ alert("请输入内容"); return; }
+  
+  btn.disabled = true;
+  btn.textContent = "提交中...";
+  resBox.textContent = "正在发起请求...";
 
-  const res = await fetch("/update",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({content})
-  });
+  try {
+    const res = await fetch("/update",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({content})
+    });
 
-  const data = await res.json();
-  document.getElementById("result").textContent =
-    JSON.stringify(data,null,2);
+    const data = await res.json();
+    resBox.textContent = JSON.stringify(data, null, 2);
+    
+    if(res.ok) {
+      alert("更新成功！请等待 GitHub Workflow 执行。");
+      document.getElementById("content").value = "";
+    } else {
+      resBox.style.color = "#ff4d4f";
+    }
+  } catch(e) {
+    resBox.textContent = "网络错误: " + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "提交到 GitHub";
+  }
 }
 </script>
 </body>
@@ -156,15 +203,15 @@ async function submitUpdate(){
 function loginPage(msg="") {
   return html(`
 <html>
-<body style="font-family:system-ui;background:#f4f6fb;padding:40px">
-<div style="background:#fff;padding:30px;border-radius:12px;max-width:400px;margin:auto">
-<h2>登录</h2>
-<form method="POST" action="/login">
-<input name="username" placeholder="用户名" required style="width:100%;padding:8px;margin-bottom:10px"><br>
-<input type="password" name="password" placeholder="密码" required style="width:100%;padding:8px;margin-bottom:10px"><br>
-<button type="submit">登录</button>
-</form>
-<p style="color:red">${msg}</p>
+<body style="font-family:system-ui;background:#f4f6fb;display:flex;height:90vh;align-items:center;justify-content:center">
+<div style="background:#fff;padding:40px;border-radius:12px;width:100%;max-width:350px;box-shadow:0 10px 25px rgba(0,0,0,.05)">
+  <h2 style="margin-top:0">控制台登录</h2>
+  <form method="POST" action="/login">
+    <input name="username" placeholder="用户名" required style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box"><br>
+    <input type="password" name="password" placeholder="密码" required style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box"><br>
+    <button type="submit" style="width:100%;padding:12px;background:#5562ff;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer">登录</button>
+  </form>
+  ${msg ? `<p style="color:#ff4d4f;background:#fff1f0;padding:10px;border-radius:4px;font-size:14px">${msg}</p>` : ""}
 </div>
 </body>
 </html>
@@ -172,7 +219,7 @@ function loginPage(msg="") {
 }
 
 //////////////////////////////////////////////////////
-// GitHub 更新
+// GitHub API 更新操作
 //////////////////////////////////////////////////////
 
 async function handleUpdate(request, kv) {
@@ -185,163 +232,73 @@ async function handleUpdate(request, kv) {
     return json({ error: "Missing content" }, 400);
   }
 
-  const [owner, repo, filePath, branch, token] = await Promise.all([
-    kv.get("GITHUB_OWNER"),
-    kv.get("GITHUB_REPO"),
-    kv.get("FILE_PATH"),
-    kv.get("BRANCH"),
-    kv.get("GH_TOKEN")
-  ]);
+  // 从 KV 获取配置
+  const config = {
+    owner: await kv.get("GITHUB_OWNER"),
+    repo: await kv.get("GITHUB_REPO"),
+    path: await kv.get("FILE_PATH"),
+    branch: await kv.get("BRANCH") || "main",
+    token: await kv.get("GH_TOKEN")
+  };
 
-  const ref = branch || "main";
+  // 检查必填项
+  if (!config.owner || !config.repo || !config.path || !config.token) {
+    return json({ error: "KV 缺少必要配置项 (OWNER/REPO/PATH/TOKEN)" }, 500);
+  }
 
-  const getUrl =
-    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${ref}`;
+  // 1. 获取文件当前 SHA (更新 GitHub 文件必须提供旧文件的 SHA)
+  const getUrl = `https://api.github.com/repos/${config.owner}/${config.repo}/contents/${config.path}?ref=${config.branch}`;
+  
+  let fileData;
+  try {
+    fileData = await safeGitHubRequest(getUrl, config.token);
+  } catch (e) {
+    return json({ error: "获取 GitHub 文件信息失败", details: e.message }, 500);
+  }
 
-  const fileData = await safeGitHubRequest(getUrl, token);
-
-  const putUrl =
-    `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
-
-  const updateResult = await safeGitHubRequest(putUrl, token, {
-    method: "PUT",
-    body: JSON.stringify({
-      message: "auto update via worker",
-      content: base64Encode(body.content),
-      sha: fileData.sha,
-      branch: ref
-    })
-  });
-
-  return json({ ok: true, commit: updateResult.commit.sha });
+  // 2. 提交 PUT 请求更新文件
+  const putUrl = `https://api.github.com/repos/${config.owner}/${config.repo}/contents/${config.path}`;
+  
+  try {
+    const updateResult = await safeGitHubRequest(putUrl, config.token, {
+      method: "PUT",
+      body: JSON.stringify({
+        message: "Update via Cloudflare Worker UI",
+        content: base64Encode(body.content),
+        sha: fileData.sha,
+        branch: config.branch
+      })
+    });
+    return json({ ok: true, sha: updateResult.commit.sha });
+  } catch (e) {
+    return json({ error: "提交更新到 GitHub 失败", details: e.message }, 500);
+  }
 }
 
 //////////////////////////////////////////////////////
-// Webhook + 持久化
+// Webhook 处理
 //////////////////////////////////////////////////////
 
 async function handleWebhook(request, kv) {
-  if (request.method !== "POST") {
-    return new Response("OK");
-  }
+  if (request.method !== "POST") return new Response("OK");
 
   const secret = await kv.get("WEBHOOK_SECRET");
   const signature = request.headers.get("x-hub-signature-256");
   const rawBody = await request.text();
 
-  if (!(await verifySignature(rawBody, signature, secret))) {
+  if (secret && !(await verifySignature(rawBody, signature, secret))) {
     return json({ error: "Invalid signature" }, 401);
   }
 
   const payload = JSON.parse(rawBody);
 
+  // 记录 Workflow Run 状态
   if (payload.workflow_run) {
-    const info = JSON.stringify({
+    const info = {
       name: payload.workflow_run.name,
       status: payload.workflow_run.status,
       conclusion: payload.workflow_run.conclusion,
-      time: new Date().toISOString()
-    }, null, 2);
-
-    await kv.put("LAST_WORKFLOW", info);
-  }
-
-  return json({ ok: true });
-}
-
-//////////////////////////////////////////////////////
-// 工具函数
-//////////////////////////////////////////////////////
-
-async function safeGitHubRequest(url, token, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      ...(options.headers || {})
-    }
-  });
-
-  const text = await response.text();
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error("GitHub returned non-JSON: " + text);
-  }
-
-  if (!response.ok) {
-    throw new Error("GitHub error: " + JSON.stringify(data));
-  }
-
-  return data;
-}
-
-async function signValue(value, secret) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(value)
-  );
-
-  return value + "." + btoa(String.fromCharCode(...new Uint8Array(sig)));
-}
-
-async function verifyValue(token, secret) {
-  const parts = token.split(".");
-  if (parts.length !== 2) return false;
-  const valid = await signValue(parts[0], secret);
-  return valid === token;
-}
-
-async function verifySignature(body, signature, secret) {
-  if (!signature || !secret) return false;
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(body)
-  );
-
-  const hex = "sha256=" +
-    Array.from(new Uint8Array(sig))
-      .map(b => b.toString(16).padStart(2, "0"))
-      .join("");
-
-  return hex === signature;
-}
-
-function base64Encode(str) {
-  return btoa(unescape(encodeURIComponent(str)));
-}
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" }
-  });
-}
-
-function html(content) {
-  return new Response(content, {
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
-}
+      url: payload.workflow_run.html_url,
+      updated_at: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+    };
+    await kv.put("LAST_WORKFLOW
