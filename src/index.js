@@ -40,7 +40,6 @@ export default {
       return new Response("Not Found", { status: 404 });
 
     } catch (err) {
-      // 捕获所有未处理异常，防止 1101 错误
       return json({ 
         error: "Worker 内部错误", 
         message: err.message,
@@ -144,7 +143,7 @@ async function uiPage(kv) {
 <div class="card">
   <h2>Docker 镜像更新 <span class="status-tag">${filePath}</span></h2>
   
-  <label class="label">输入新的配置内容 (如 python:3.11-slim):</label>
+  <label class="label">输入新的配置内容:</label>
   <textarea id="content" placeholder="输入内容会直接覆盖文件..."></textarea>
   
   <div class="actions">
@@ -182,13 +181,11 @@ async function submitUpdate(){
     resBox.textContent = JSON.stringify(data, null, 2);
     
     if(res.ok) {
-      alert("更新成功！请等待 GitHub Workflow 执行。");
+      alert("更新成功！");
       document.getElementById("content").value = "";
-    } else {
-      resBox.style.color = "#ff4d4f";
     }
   } catch(e) {
-    resBox.textContent = "网络错误: " + e.message;
+    resBox.textContent = "错误: " + e.message;
   } finally {
     btn.disabled = false;
     btn.textContent = "提交到 GitHub";
@@ -205,13 +202,13 @@ function loginPage(msg="") {
 <html>
 <body style="font-family:system-ui;background:#f4f6fb;display:flex;height:90vh;align-items:center;justify-content:center">
 <div style="background:#fff;padding:40px;border-radius:12px;width:100%;max-width:350px;box-shadow:0 10px 25px rgba(0,0,0,.05)">
-  <h2 style="margin-top:0">控制台登录</h2>
+  <h2>控制台登录</h2>
   <form method="POST" action="/login">
     <input name="username" placeholder="用户名" required style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box"><br>
     <input type="password" name="password" placeholder="密码" required style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box"><br>
     <button type="submit" style="width:100%;padding:12px;background:#5562ff;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer">登录</button>
   </form>
-  ${msg ? `<p style="color:#ff4d4f;background:#fff1f0;padding:10px;border-radius:4px;font-size:14px">${msg}</p>` : ""}
+  ${msg ? `<p style="color:#ff4d4f;font-size:14px">${msg}</p>` : ""}
 </div>
 </body>
 </html>
@@ -223,16 +220,7 @@ function loginPage(msg="") {
 //////////////////////////////////////////////////////
 
 async function handleUpdate(request, kv) {
-  if (request.method !== "POST") {
-    return json({ error: "Method not allowed" }, 405);
-  }
-
   const body = await request.json();
-  if (!body.content) {
-    return json({ error: "Missing content" }, 400);
-  }
-
-  // 从 KV 获取配置
   const config = {
     owner: await kv.get("GITHUB_OWNER"),
     repo: await kv.get("GITHUB_REPO"),
@@ -241,38 +229,25 @@ async function handleUpdate(request, kv) {
     token: await kv.get("GH_TOKEN")
   };
 
-  // 检查必填项
   if (!config.owner || !config.repo || !config.path || !config.token) {
-    return json({ error: "KV 缺少必要配置项 (OWNER/REPO/PATH/TOKEN)" }, 500);
+    return json({ error: "KV 缺少必要配置项" }, 500);
   }
 
-  // 1. 获取文件当前 SHA (更新 GitHub 文件必须提供旧文件的 SHA)
   const getUrl = `https://api.github.com/repos/${config.owner}/${config.repo}/contents/${config.path}?ref=${config.branch}`;
-  
-  let fileData;
-  try {
-    fileData = await safeGitHubRequest(getUrl, config.token);
-  } catch (e) {
-    return json({ error: "获取 GitHub 文件信息失败", details: e.message }, 500);
-  }
+  const fileData = await safeGitHubRequest(getUrl, config.token);
 
-  // 2. 提交 PUT 请求更新文件
   const putUrl = `https://api.github.com/repos/${config.owner}/${config.repo}/contents/${config.path}`;
-  
-  try {
-    const updateResult = await safeGitHubRequest(putUrl, config.token, {
-      method: "PUT",
-      body: JSON.stringify({
-        message: "Update via Cloudflare Worker UI",
-        content: base64Encode(body.content),
-        sha: fileData.sha,
-        branch: config.branch
-      })
-    });
-    return json({ ok: true, sha: updateResult.commit.sha });
-  } catch (e) {
-    return json({ error: "提交更新到 GitHub 失败", details: e.message }, 500);
-  }
+  const updateResult = await safeGitHubRequest(putUrl, config.token, {
+    method: "PUT",
+    body: JSON.stringify({
+      message: "Update via Worker UI",
+      content: base64Encode(body.content),
+      sha: fileData.sha,
+      branch: config.branch
+    })
+  });
+
+  return json({ ok: true, sha: updateResult.commit.sha });
 }
 
 //////////////////////////////////////////////////////
@@ -281,24 +256,75 @@ async function handleUpdate(request, kv) {
 
 async function handleWebhook(request, kv) {
   if (request.method !== "POST") return new Response("OK");
-
-  const secret = await kv.get("WEBHOOK_SECRET");
-  const signature = request.headers.get("x-hub-signature-256");
   const rawBody = await request.text();
-
-  if (secret && !(await verifySignature(rawBody, signature, secret))) {
-    return json({ error: "Invalid signature" }, 401);
-  }
-
   const payload = JSON.parse(rawBody);
 
-  // 记录 Workflow Run 状态
   if (payload.workflow_run) {
     const info = {
       name: payload.workflow_run.name,
       status: payload.workflow_run.status,
       conclusion: payload.workflow_run.conclusion,
-      url: payload.workflow_run.html_url,
-      updated_at: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+      time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
     };
-    await kv.put("LAST_WORKFLOW
+    await kv.put("LAST_WORKFLOW", JSON.stringify(info, null, 2));
+  }
+  return json({ ok: true });
+}
+
+//////////////////////////////////////////////////////
+// 工具函数
+//////////////////////////////////////////////////////
+
+async function safeGitHubRequest(url, token, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/vnd.github+json",
+      "User-Agent": "Cloudflare-Worker-Docker-Updater",
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await response.text();
+  const data = JSON.parse(text);
+  if (!response.ok) throw new Error(data.message || "GitHub API Error");
+  return data;
+}
+
+function base64Encode(str) {
+  const bytes = new TextEncoder().encode(str);
+  const binString = String.fromCharCode(...bytes);
+  return btoa(binString);
+}
+
+async function signValue(value, secret) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  return value + "." + btoa(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+async function verifyValue(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const valid = await signValue(parts[0], secret);
+  return valid === token;
+}
+
+async function verifySignature(body, signature, secret) {
+  if (!signature || !secret) return false;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+  const hex = "sha256=" + Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+  return hex === signature;
+}
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+}
+
+function html(content) {
+  return new Response(content, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
