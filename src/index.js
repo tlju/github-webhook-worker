@@ -37,7 +37,7 @@ export default {
       }
 
       if (url.pathname === "/webhook") {
-        return handleWebhook(request, kv);
+        return handleWebhook(request, kv);  // 处理 webhook 请求
       }
 
       // 根目录自动跳转到 /ui
@@ -48,10 +48,10 @@ export default {
       return new Response("Not Found", { status: 404 });
 
     } catch (err) {
-      return json({ 
-        error: "Worker 内部错误", 
+      return json({
+        error: "Worker 内部错误",
         message: err.message,
-        stack: err.stack 
+        stack: err.stack
       }, 500);
     }
   }
@@ -306,7 +306,7 @@ async function handleWebhook(request, kv) {
       conclusion: payload.workflow_run.conclusion,
       time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
     };
-    await kv.put("LAST_WORKFLOW", JSON.stringify(info, null, 2));
+    await kv.put("LAST_WORKFLOW", JSON.stringify(info, null, 2)); // 将 workflow 状态存储到 KV
   }
   return json({ ok: true });
 }
@@ -350,15 +350,6 @@ async function verifyValue(token, secret) {
   if (parts.length !== 2) return false;
   const valid = await signValue(parts[0], secret);
   return valid === token;
-}
-
-async function verifySignature(body, signature, secret) {
-  if (!signature || !secret) return false;
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-  const hex = "sha256=" + Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
-  return hex === signature;
 }
 
 function json(obj, status = 200) {
