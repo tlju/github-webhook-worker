@@ -16,6 +16,14 @@ export default {
         return handleLogout();
       }
 
+      if (url.pathname === "/status") {
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return json({ error: "Unauthorized" }, 401);
+  
+        const status = await kv.get("LAST_WORKFLOW");
+        return json({ status: status ? JSON.parse(status) : null });
+      }
+
       if (url.pathname === "/ui") {
         const ok = await isAuthenticated(request, kv);
         if (!ok) return loginPage();
@@ -115,7 +123,6 @@ async function isAuthenticated(request, kv) {
 
 async function uiPage(kv) {
   const lastWorkflow = await kv.get("LAST_WORKFLOW");
-  const filePath = await kv.get("FILE_PATH") || "未设置";
 
   return html(`
 <!doctype html>
@@ -125,50 +132,47 @@ async function uiPage(kv) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Docker 控制台</title>
 <style>
-  body{font-family:system-ui,-apple-system,sans-serif;background:#f4f6fb;padding:20px;color:#333}
-  .card{background:#fff;padding:24px;border-radius:12px;max-width:800px;margin:auto;box-shadow:0 4px 20px rgba(0,0,0,.08)}
-  h2{margin-top:0;color:#1a1a1a}
-  textarea{width:100%;height:180px;border:1px solid #ddd;border-radius:8px;padding:12px;font-family:monospace;box-sizing:border-box;font-size:14px;background:#fafafa}
-  textarea:focus{outline:2px solid #5562ff;border-color:transparent}
-  .actions{margin-top:15px;display:flex;justify-content:space-between;align-items:center}
-  button{padding:10px 24px;border:none;border-radius:8px;background:#5562ff;color:white;cursor:pointer;font-weight:600;transition:background 0.2s}
-  button:hover{background:#3e49df}
-  button:disabled{background:#ccc;cursor:not-allowed}
-  pre{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;overflow-x:auto;font-size:13px}
-  .label{font-weight:bold;margin-bottom:8px;display:block}
-  .status-tag{padding:4px 8px;border-radius:4px;font-size:12px;background:#eee}
+  body{font-family:system-ui;background:#f4f6fb;padding:20px}
+  .card{background:#fff;padding:24px;border-radius:12px;max-width:750px;margin:auto;box-shadow:0 10px 30px rgba(0,0,0,.05)}
+  textarea{width:100%;height:120px;border:1px solid #ddd;border-radius:8px;padding:12px;font-family:monospace;box-sizing:border-box}
+  button{padding:10px 20px;border:none;border-radius:8px;background:#5562ff;color:white;cursor:pointer;font-weight:bold}
+  button:disabled{background:#ccc}
+  pre{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;font-size:13px;overflow-x:auto}
+  .status-header{display:flex;justify-content:space-between;align-items:center}
+  .dot{height:10px;width:10px;background-color:#bbb;border-radius:50%;display:inline-block;margin-right:5px}
+  .dot.active{background-color:#52c41a;box-shadow:0 0 8px #52c41a}
+  .update-time{font-size:12px;color:#888}
 </style>
 </head>
 <body>
 <div class="card">
-  <h2>Docker 镜像更新 <span class="status-tag">${filePath}</span></h2>
-  
-  <label class="label">输入新的配置内容:</label>
-  <textarea id="content" placeholder="输入内容会直接覆盖文件..."></textarea>
-  
-  <div class="actions">
-    <button id="submitBtn" onclick="submitUpdate()">提交到 GitHub</button>
-    <a href="/logout" style="color:#666;text-decoration:none;font-size:14px">退出登录</a>
+  <h2>Docker 镜像更新</h2>
+
+  <textarea id="content" placeholder="输入新的镜像标签或配置..."></textarea>
+  <div style="margin-top:10px">
+    <button id="submitBtn" onclick="submitUpdate()">提交更新</button>
+    <a href="/logout" style="float:right;color:#666;text-decoration:none;font-size:14px;margin-top:10px">退出登录</a>
   </div>
 
-  <h3>最近 Workflow 状态</h3>
+  <div class="status-header">
+    <h3>最近 Workflow 状态 <span id="syncDot" class="dot"></span></h3>
+    <span id="lastSync" class="update-time">等待同步...</span>
+  </div>
   <pre id="workflowStatus">${lastWorkflow || "暂无记录"}</pre>
 
-  <h3>操作日志</h3>
-  <pre id="result">等待提交...</pre>
+  <h3>提交结果</h3>
+  <pre id="result">尚未提交</pre>
 </div>
 
 <script>
+// --- 提交逻辑 ---
 async function submitUpdate(){
   const btn = document.getElementById("submitBtn");
   const content = document.getElementById("content").value.trim();
-  const resBox = document.getElementById("result");
-
   if(!content){ alert("请输入内容"); return; }
-  
+
   btn.disabled = true;
   btn.textContent = "提交中...";
-  resBox.textContent = "正在发起请求...";
 
   try {
     const res = await fetch("/update",{
@@ -176,21 +180,57 @@ async function submitUpdate(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({content})
     });
-
     const data = await res.json();
-    resBox.textContent = JSON.stringify(data, null, 2);
-    
-    if(res.ok) {
-      alert("更新成功！");
-      document.getElementById("content").value = "";
-    }
+    document.getElementById("result").textContent = JSON.stringify(data,null,2);
+    if(res.ok) alert("提交成功！任务排队中...");
   } catch(e) {
-    resBox.textContent = "错误: " + e.message;
+    alert("提交失败: " + e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = "提交到 GitHub";
+    btn.textContent = "提交更新";
   }
 }
+
+// --- 自动刷新逻辑 ---
+async function refreshWorkflowStatus() {
+  const dot = document.getElementById("syncDot");
+  const timeLabel = document.getElementById("lastSync");
+  const statusBox = document.getElementById("workflowStatus");
+
+  try {
+    const res = await fetch("/status");
+    if (!res.ok) throw new Error("Unauthorized");
+    
+    const data = await res.json();
+    if (data.status) {
+      statusBox.textContent = JSON.stringify(data.status, null, 2);
+      
+      // 根据结论调整边框颜色 (成功:绿, 失败:红, 运行中:蓝)
+      const conclusion = data.status.conclusion;
+      const status = data.status.status;
+      
+      if (status !== "completed") {
+        statusBox.style.borderLeft = "4px solid #1890ff"; // 运行中
+      } else {
+        statusBox.style.borderLeft = conclusion === "success" ? "4px solid #52c41a" : "4px solid #ff4d4f";
+      }
+    }
+
+    // 闪烁一下指示灯表示数据已同步
+    dot.classList.add("active");
+    timeLabel.textContent = "最后同步: " + new Date().toLocaleTimeString();
+    setTimeout(() => dot.classList.remove("active"), 500);
+
+  } catch (e) {
+    console.error("同步失败:", e);
+    timeLabel.textContent = "同步失败，请检查登录状态";
+  }
+}
+
+// 每 5 秒刷新一次
+setInterval(refreshWorkflowStatus, 5000);
+// 页面加载完成后立即刷新一次
+window.onload = refreshWorkflowStatus;
 </script>
 </body>
 </html>
