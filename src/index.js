@@ -1,228 +1,284 @@
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const kv = env.DOCKER_KV;
 
     if (!kv) {
-      return new Response("KV not bound", { status: 500 });
+      return new Response("KV 未绑定 DOCKER_KV", { status: 500 });
     }
 
-    if (url.pathname === "/login") {
-      return handleLogin(request);
-    }
+    try {
+      if (url.pathname === "/login") return handleLogin(request, kv);
+      if (url.pathname === "/logout") return handleLogout();
 
-    if (url.pathname === "/logout") {
-      return handleLogout();
-    }
+      if (url.pathname === "/status") {
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return json({ error: "Unauthorized" }, 401);
+        const status = await kv.get("LAST_WORKFLOW");
+        return json({ status: status ? JSON.parse(status) : null });
+      }
 
-    if (!isAuthenticated(request)) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+      if (url.pathname === "/ui") {
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return loginPage();
+        return uiPage();
+      }
 
-    if (url.pathname === "/submit" && request.method === "POST") {
-      return handleSubmit(request, kv);
-    }
+      if (url.pathname === "/update") {
+        const ok = await isAuthenticated(request, kv);
+        if (!ok) return json({ error: "Unauthorized" }, 401);
+        return handleUpdate(request, kv);
+      }
 
-    return new Response(renderPage(), {
-      headers: { "Content-Type": "text/html;charset=UTF-8" }
-    });
+      if (url.pathname === "/webhook") {
+        return handleWebhook(request, kv);
+      }
+
+      if (url.pathname === "/") {
+        return Response.redirect(`${url.origin}/ui`, 302);
+      }
+
+      return new Response("Not Found", { status: 404 });
+
+    } catch (err) {
+      return json({ error: err.message, stack: err.stack }, 500);
+    }
   }
 };
 
-////////////////////////////////////////////////////////
-// 登录认证
-////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////
+// UI 页面
+//////////////////////////////////////////////////////
 
-function isAuthenticated(request) {
-  const cookie = request.headers.get("Cookie") || "";
-  return cookie.includes("auth=1");
-}
+function uiPage() {
+  return html(`
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker 控制台</title>
+<style>
+body{font-family:system-ui;background:#f4f6fb;padding:20px}
+.card{background:#fff;padding:24px;border-radius:12px;max-width:750px;margin:auto;box-shadow:0 10px 30px rgba(0,0,0,.05)}
+textarea{width:100%;height:120px;border:1px solid #ddd;border-radius:8px;padding:12px;font-family:monospace}
+button{padding:10px 20px;border:none;border-radius:8px;background:#5562ff;color:white;cursor:pointer;font-weight:bold}
+pre{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;font-size:13px;overflow-x:auto}
+.dot{height:10px;width:10px;background-color:#bbb;border-radius:50%;display:inline-block;margin-right:5px}
+.dot.active{background-color:#52c41a;box-shadow:0 0 8px #52c41a}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>Docker 镜像更新</h2>
 
-async function handleLogin(request) {
-  return new Response("ok", {
-    headers: {
-      "Set-Cookie": "auth=1; Path=/; HttpOnly",
-    }
+<textarea id="content" placeholder="输入镜像版本号，例如 3.12"></textarea>
+
+<div style="margin-top:10px">
+<button id="submitBtn" onclick="submitUpdate()">提交更新</button>
+<a href="/logout" style="float:right;color:#666;text-decoration:none;font-size:14px;margin-top:10px">退出登录</a>
+</div>
+
+<h3>Workflow 状态 <span id="syncDot" class="dot"></span></h3>
+<pre id="workflowStatus">尚未提交</pre>
+
+<h3 id="pullTitle" style="display:none">拉取命令</h3>
+<pre id="pullCmd" style="display:none"></pre>
+
+</div>
+
+<script>
+let polling = null;
+let currentVersion = "";
+
+async function submitUpdate(){
+  const btn = document.getElementById("submitBtn");
+  const content = document.getElementById("content").value.trim();
+  if(!content){ alert("请输入镜像版本号"); return; }
+
+  currentVersion = content;
+
+  btn.disabled = true;
+  btn.textContent = "提交中...";
+
+  await fetch("/update",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({content})
   });
+
+  btn.textContent = "处理中...";
+  startPolling();
 }
 
-function handleLogout() {
-  return new Response("logout", {
-    headers: {
-      "Set-Cookie": "auth=0; Path=/; Max-Age=0"
+function startPolling(){
+  if(polling) clearInterval(polling);
+  polling = setInterval(refreshWorkflowStatus, 4000);
+  refreshWorkflowStatus();
+}
+
+async function refreshWorkflowStatus(){
+  const dot = document.getElementById("syncDot");
+  const statusBox = document.getElementById("workflowStatus");
+
+  try{
+    const res = await fetch("/status");
+    const data = await res.json();
+    if(!data.status) return;
+
+    statusBox.textContent = JSON.stringify(data.status, null, 2);
+    dot.classList.add("active");
+    setTimeout(()=>dot.classList.remove("active"),500);
+
+    if(data.status.status === "completed"){
+      clearInterval(polling);
+
+      if(data.status.conclusion === "success"){
+        showPullCommand();
+      }else{
+        alert("Workflow 执行失败");
+      }
     }
-  });
+
+  }catch(e){
+    console.error(e);
+  }
 }
 
-////////////////////////////////////////////////////////
-// 提交 & 触发 workflow
-////////////////////////////////////////////////////////
+async function showPullCommand(){
+  const res = await fetch("/status");
+  const data = await res.json();
+  if(!data.status || !data.status.pull_command) return;
 
-async function handleSubmit(request, kv) {
+  document.getElementById("pullTitle").style.display = "block";
+  const box = document.getElementById("pullCmd");
+  box.style.display = "block";
+  box.textContent = data.status.pull_command;
+}
+</script>
+</body>
+</html>
+`);
+}
+
+//////////////////////////////////////////////////////
+// 更新逻辑
+//////////////////////////////////////////////////////
+
+async function handleUpdate(request, kv) {
   const body = await request.json();
-  const version = body.version;
+  const version = body.content;
 
-  const token = await kv.get("GITHUB_TOKEN");
-  const owner = await kv.get("GITHUB_OWNER");
-  const repo = await kv.get("GITHUB_REPO");
-  const registry = await kv.get("ALIYUN_REGISTRY");
+  await kv.put("CURRENT_VERSION", version);
 
-  if (!token || !owner || !repo || !registry) {
-    return json({ error: "Missing KV config" }, 500);
-  }
+  return json({ ok: true });
+}
 
-  const filename = "images.txt";
+//////////////////////////////////////////////////////
+// Webhook 处理
+//////////////////////////////////////////////////////
 
-  // 1️⃣ 获取当前文件 sha
-  const fileRes = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/contents/${filename}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const fileData = await fileRes.json();
+async function handleWebhook(request, kv) {
+  if (request.method !== "POST") return new Response("OK");
 
-  // 2️⃣ 更新文件
-  const content = btoa(`python:${version}\n`);
+  const payload = await request.json();
 
-  await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/contents/${filename}`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        message: `update python:${version}`,
-        content,
-        sha: fileData.sha
-      })
+  if (payload.workflow_run) {
+
+    const registry = await kv.get("ALIYUN_REGISTRY");
+    const version = await kv.get("CURRENT_VERSION");
+
+    let pullCmd = null;
+
+    if (payload.workflow_run.conclusion === "success") {
+      pullCmd = `docker pull ${registry}/python:${version}`;
     }
-  );
 
-  // 3️⃣ 等待 workflow_run 出现
-  const workflowId = await waitForWorkflowRun(token, owner, repo);
+    const info = {
+      name: payload.workflow_run.name,
+      status: payload.workflow_run.status,
+      conclusion: payload.workflow_run.conclusion,
+      pull_command: pullCmd,
+      time: new Date().toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"})
+    };
 
-  if (!workflowId) {
-    return json({ error: "Workflow not triggered" }, 500);
+    await kv.put("LAST_WORKFLOW", JSON.stringify(info));
   }
 
-  // 4️⃣ 精确匹配 workflow_run.id 轮询
-  const result = await pollWorkflow(token, owner, repo, workflowId, 600);
+  return json({ ok: true });
+}
 
-  if (result === "success") {
-    const cmd = `docker pull ${registry}/python:${version}`;
-    return json({
-      status: "success",
-      command: cmd
+//////////////////////////////////////////////////////
+// 鉴权与工具函数
+//////////////////////////////////////////////////////
+
+async function handleLogin(request, kv) {
+  if (request.method !== "POST") return loginPage();
+  const form = await request.formData();
+  const username = form.get("username");
+  const password = form.get("password");
+
+  const [kvUser, kvPass, secret] = await Promise.all([
+    kv.get("UI_USERNAME"),
+    kv.get("UI_PASSWORD"),
+    kv.get("SESSION_SECRET")
+  ]);
+
+  if (username === kvUser && password === kvPass) {
+    const token = await signValue(username, secret);
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": "/ui",
+        "Set-Cookie": `session=${token}; HttpOnly; Path=/; SameSite=Strict; Secure`
+      }
     });
   }
 
-  return json({
-    status: "failure"
+  return loginPage("用户名或密码错误");
+}
+
+function handleLogout() {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      "Location": "/ui",
+      "Set-Cookie": "session=deleted; Path=/; Max-Age=0"
+    }
   });
 }
 
-////////////////////////////////////////////////////////
-// 等待最新 workflow_run
-////////////////////////////////////////////////////////
-
-async function waitForWorkflowRun(token, owner, repo) {
-  const startTime = Date.now();
-  const timeout = 60000;
-
-  while (Date.now() - startTime < timeout) {
-    const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=1`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-
-    const data = await res.json();
-
-    if (data.workflow_runs.length > 0) {
-      const run = data.workflow_runs[0];
-      return run.id;
-    }
-
-    await sleep(3000);
-  }
-
-  return null;
+async function isAuthenticated(request, kv) {
+  const cookie = request.headers.get("Cookie") || "";
+  const match = cookie.match(/session=([^;]+)/);
+  if (!match) return false;
+  const token = match[1];
+  const secret = await kv.get("SESSION_SECRET");
+  return verifyValue(token, secret);
 }
 
-////////////////////////////////////////////////////////
-// 精确匹配 workflow_run.id 轮询
-////////////////////////////////////////////////////////
-
-async function pollWorkflow(token, owner, repo, runId, timeoutSeconds) {
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeoutSeconds * 1000) {
-    const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-
-    const data = await res.json();
-
-    if (data.status === "completed") {
-      if (data.conclusion === "success") {
-        return "success";
-      }
-      if (data.conclusion === "failure") {
-        return "failure";
-      }
-    }
-
-    await sleep(5000);
-  }
-
-  return "timeout";
+async function signValue(value, secret) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  return value + "." + btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-////////////////////////////////////////////////////////
-// 页面
-////////////////////////////////////////////////////////
-
-function renderPage() {
-  return `
-  <html>
-  <body>
-    <h2>Docker 镜像更新</h2>
-    <input id="version" placeholder="输入版本号"/>
-    <button onclick="submit()">提交更新</button>
-    <pre id="result"></pre>
-
-    <script>
-      async function submit(){
-        const version = document.getElementById('version').value;
-
-        const res = await fetch('/submit',{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({version})
-        });
-
-        const data = await res.json();
-        document.getElementById('result').innerText =
-          JSON.stringify(data,null,2);
-      }
-    </script>
-  </body>
-  </html>
-  `;
+async function verifyValue(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const valid = await signValue(parts[0], secret);
+  return valid === token;
 }
 
-////////////////////////////////////////////////////////
-// 工具函数
-////////////////////////////////////////////////////////
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function loginPage(msg=""){
+  return html("<h2>请登录</h2>");
 }
 
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" }
-  });
+function json(obj,status=200){
+  return new Response(JSON.stringify(obj),{status,headers:{"Content-Type":"application/json"}});
+}
+
+function html(content){
+  return new Response(content,{headers:{"Content-Type":"text/html; charset=utf-8"}});
 }
