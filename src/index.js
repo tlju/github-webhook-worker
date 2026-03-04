@@ -122,10 +122,10 @@ async function isAuthenticated(request, kv) {
 //////////////////////////////////////////////////////
 
 async function uiPage(kv) {
-  // 读取 ALIYUN_REGISTRY 注入到页面
-  const aliyunRegistry = await kv.get("ALIYUN_REGISTRY") || "";
+// 获取阿里云镜像源配置，若KV未配置则使用默认值
+const aliyunRegistry = await kv.get("ALIYUN_REGISTRY") || "registry.cn-hangzhou.aliyuncs.com/tlju-docker-images";
 
-  return html(`
+return html(`
 <!doctype html>
 <html>
 <head>
@@ -168,9 +168,6 @@ pre{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;font-size:13
 </div>
 
 <script>
-
-// 从服务端注入的 registry（若为空字符串则表示未配置）
-const ALIYUN_REGISTRY = ${JSON.stringify(aliyunRegistry)};
 
 let polling = null;
 let currentWorkflowId = null;
@@ -235,27 +232,12 @@ async function checkStatus(){
 
 function showPullCommand(){
   const image = document.getElementById("content").value.trim();
-  let fullImage = image;
-
-  if (ALIYUN_REGISTRY && ALIYUN_REGISTRY.trim() !== "") {
-    // 如果用户输入已经包含 registry（例如以域名开头）则不重复拼接
-    // 简单判断：若 image 的第一段包含点号（例如 registry.example.com/...），则认为已经带 registry
-    const firstSegment = image.split('/')[0];
-    const firstHasDot = firstSegment.includes('.');
-    const alreadyStartsWithRegistry = image.startsWith(ALIYUN_REGISTRY);
-
-    if (!alreadyStartsWithRegistry && !firstHasDot) {
-      // 既不是以 ALIYUN_REGISTRY 开头，也不像带有 registry 的形式，拼接 ALIYUN_REGISTRY
-      // 确保不产生重复斜杠
-      if (ALIYUN_REGISTRY.endsWith('/')) {
-        fullImage = ALIYUN_REGISTRY + image;
-      } else {
-        fullImage = ALIYUN_REGISTRY + '/' + image;
-      }
-    } // 否则保持原样（用户已提供完整镜像路径或已经以 ALIYUN_REGISTRY 开头）
-  }
-
-  const cmd = "docker pull " + fullImage;
+  const registry = "${aliyunRegistry}";
+  
+  // 去除可能的重复斜杠进行安全拼接
+  const cleanRegistry = registry.endsWith("/") ? registry.slice(0, -1) : registry;
+  const cleanImage = image.startsWith("/") ? image.slice(1) : image;
+  const cmd = "docker pull " + cleanRegistry + "/" + cleanImage;
 
   document.getElementById("pullCmd").textContent = cmd;
   document.getElementById("pullSection").style.display="block";
