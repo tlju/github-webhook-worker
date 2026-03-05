@@ -11,7 +11,7 @@
  * 1. 把 https://tlju.qzz.io 加入 /etc/docker/daemon.json 的 registry-mirrors
  * 2. docker pull redis / python / nginx …… 全部自动触发构建并拉取
  * 
- * 新增：支持私有 ACR 仓库认证，使用 Basic Auth（从 KV 获取用户名/密码）
+ * 新增：支持私有 ACR 仓库认证，使用 Docker Registry token 认证流程（处理 401 challenge，获取 Bearer token）
  */
 export default {
   async fetch(request, env) {
@@ -133,13 +133,13 @@ async function handleRegistry(request, kv, url) {
     });
   }
 
-  // ====================== 阿里云路径修正 + 认证准备 ======================
+  // ====================== 阿里云路径修正 ======================
   const aliyunRegistry = await kv.get("ALIYUN_REGISTRY") || "registry.cn-hangzhou.aliyuncs.com/tlju-docker-images";
   const [registryHost, ...repoParts] = aliyunRegistry.split('/');
   const repoPrefix = repoParts.join('/');                    // tlju-docker-images
   const aliyun_base = `https://${registryHost}`;
 
-  // 关键修复：强制加上命名空间前缀
+  // 强制加上命名空间前缀
   let proxy_path = pathname.replace(/^\/v2\/(library\/)?/, `/v2/${repoPrefix}/`);
 
   const proxy_url = `${aliyun_base}${proxy_path}${url.search}`;
@@ -150,19 +150,14 @@ async function handleRegistry(request, kv, url) {
   if (!username || !password) {
     return new Response("KV 缺少 ALIYUN_USERNAME 或 ALIYUN_PASSWORD", { status: 500 });
   }
-  const auth = `Basic ${btoa(`${username}:${password}`)}`;
-
-  // 构建代理 headers，添加 Authorization
-  const proxyHeaders = new Headers(request.headers);
-  proxyHeaders.set("Authorization", auth);
 
   // ====================== 清单请求（manifests）才做状态检查与触发 ======================
   const parts = pathname.split('/');
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
     const ref = parts[parts.length - 1];
     if (ref.startsWith("sha256:")) {
-      // 摘要请求直接代理（带认证）
-      return await fetch(proxy_url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: "follow" });
+      // 摘要请求直接代理（带认证处理）
+      return await proxyWithAuth(proxy_url, request, username, password);
     }
 
     const image_name = parts.slice(2, parts.length - 2).join("/");
@@ -174,8 +169,8 @@ async function handleRegistry(request, kv, url) {
     const status = await kv.get(status_key);
 
     if (status === "ready") {
-      // 已构建好，直接代理（带认证）
-      return await fetch(proxy_url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: "follow" });
+      // 已构建好，直接代理（带认证处理）
+      return await proxyWithAuth(proxy_url, request, username, password);
     }
 
     if (status === "building") {
@@ -199,8 +194,72 @@ async function handleRegistry(request, kv, url) {
     });
   }
 
-  // 其他请求（blobs、tags/list 等）直接代理（带认证）
-  return await fetch(proxy_url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: "follow" });
+  // 其他请求（blobs、tags/list 等）直接代理（带认证处理）
+  return await proxyWithAuth(proxy_url, request, username, password);
+}
+
+/** ====================== 新增：代理请求 + 处理 ACR 认证挑战 ====================== */
+async function proxyWithAuth(proxy_url, request, username, password) {
+  let response = await fetch(proxy_url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    redirect: "follow"
+  });
+
+  if (response.status === 401) {
+    // 处理 401 Unauthorized，获取 token
+    const wwwAuth = response.headers.get("WWW-Authenticate");
+    if (!wwwAuth) {
+      throw new Error("No WWW-Authenticate header in 401 response");
+    }
+
+    // 解析 WWW-Authenticate: Bearer realm="https://auth.aliyuncs.com/token",service="registry.aliyuncs.com",scope="repository:tlju-docker-images/python:pull"
+    const authParams = new Map(wwwAuth.split(',').map(p => p.trim().split('=').map(s => s.replace(/"/g, ''))));
+    const realm = authParams.get('realm') || authParams.get('Bearer realm');
+    const service = authParams.get('service');
+    const scope = authParams.get('scope');
+
+    if (!realm) {
+      throw new Error("No realm in WWW-Authenticate");
+    }
+
+    // 构建 token 请求 URL
+    let tokenUrl = `${realm}?service=${service}`;
+    if (scope) {
+      tokenUrl += `&scope=${encodeURIComponent(scope)}`;
+    }
+
+    // 使用 Basic Auth 请求 token
+    const basicAuth = `Basic ${btoa(`${username}:${password}`)}`;
+    const tokenResponse = await fetch(tokenUrl, {
+      headers: { Authorization: basicAuth }
+    });
+
+    if (!tokenResponse.ok) {
+      throw new Error(`Failed to get token: ${tokenResponse.status}`);
+    }
+
+    const tokenData = await tokenResponse.json();
+    const token = tokenData.token || tokenData.access_token;
+
+    if (!token) {
+      throw new Error("No token in response");
+    }
+
+    // 用 Bearer token 重试原请求
+    const authHeaders = new Headers(request.headers);
+    authHeaders.set("Authorization", `Bearer ${token}`);
+
+    response = await fetch(proxy_url, {
+      method: request.method,
+      headers: authHeaders,
+      body: request.body,
+      redirect: "follow"
+    });
+  }
+
+  return response;
 }
 
 /** ====================== 工具函数 ====================== */
