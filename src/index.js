@@ -12,6 +12,7 @@
  * 2. docker pull redis / python / nginx …… 全部自动触发构建并拉取
  * 
  * 新增：支持私有 ACR 仓库认证，使用 Docker Registry token 认证流程（处理 401 challenge，获取 Bearer token）
+ * 优化：对于 manifests tag 请求，先尝试代理，如果 200 则 set ready 并返回；如果 404 则检查状态/触发构建，返回 503 让 Docker 重试
  */
 export default {
   async fetch(request, env) {
@@ -162,36 +163,41 @@ async function handleRegistry(request, kv, url) {
 
     const image_name = parts.slice(2, parts.length - 2).join("/");
     const tag = ref || "latest";
-    // 去掉 library/ 前缀，得到实际镜像名 python:latest
+    // 去掉 library/ 前缀，得到实际镜像名 redis:latest
     const content = image_name.replace(/^library\//, "") + ":" + tag;
 
     const status_key = `IMAGE_STATUS_${content.replace(/[:/]/g, "_")}`;
-    const status = await kv.get(status_key);
 
-    if (status === "ready") {
-      // 已构建好，直接代理（带认证处理）
-      return await proxyWithAuth(proxy_url, request, username, password);
+    // 先尝试代理 manifest
+    let response = await proxyWithAuth(proxy_url, request, username, password);
+
+    if (response.ok) {
+      // 如果 200，设置 ready（如果未设）
+      const status = await kv.get(status_key);
+      if (status !== "ready") {
+        await kv.put(status_key, "ready");
+      }
+      return response;
+    } else if (response.status === 404) {
+      // 如果 404，检查状态
+      const status = await kv.get(status_key);
+      if (status === "building") {
+        return new Response(null, { status: 503, headers: { "Retry-After": "30" } });
+      } else if (status === "failed") {
+        return new Response(null, { status: 500 });
+      } else {
+        // 触发构建
+        try {
+          await handleUpdate({ content }, kv);
+        } catch (err) {
+          return new Response("启动构建失败: " + err.message, { status: 500 });
+        }
+        return new Response(null, { status: 503, headers: { "Retry-After": "30" } });
+      }
+    } else {
+      // 其他状态码，直接返回（例如 401 已由 proxyWithAuth 处理）
+      return response;
     }
-
-    if (status === "building") {
-      return new Response("镜像正在构建中，请稍后重试...", { status: 503, headers: { "Retry-After": "30" } });
-    }
-
-    if (status === "failed") {
-      return new Response("镜像构建失败", { status: 500 });
-    }
-
-    // 第一次请求 → 触发构建
-    try {
-      await handleUpdate({ content }, kv);
-    } catch (err) {
-      return new Response("启动构建失败: " + err.message, { status: 500 });
-    }
-
-    return new Response("正在启动构建，请稍后重试...", {
-      status: 503,
-      headers: { "Retry-After": "30" }
-    });
   }
 
   // 其他请求（blobs、tags/list 等）直接代理（带认证处理）
