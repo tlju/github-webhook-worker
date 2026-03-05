@@ -3,6 +3,8 @@
  * 域名：tlju.qzz.io
  * 配置全部存放在 KV 命名空间 DOCKER_KV 中：
  * - ALIYUN_REGISTRY（默认 registry.cn-hangzhou.aliyuncs.com/tlju-docker-images）
+ * - ALIYUN_USERNAME（阿里云 ACR 用户名）
+ * - ALIYUN_PASSWORD（阿里云 ACR 密码，用于 Basic Auth）
  * - GITHUB_OWNER / GITHUB_REPO / FILE_PATH / BRANCH / GH_TOKEN
  *
  * 使用方法：
@@ -140,13 +142,26 @@ async function handleRegistry(request, kv, url) {
 
   const proxy_url = `${aliyun_base}${proxy_path}${url.search}`;
 
+  // ====================== 获取阿里云认证信息 ======================
+  const username = await kv.get("ALIYUN_USERNAME");
+  const password = await kv.get("ALIYUN_PASSWORD");
+  if (!username || !password) {
+    return new Response("KV 缺少 ALIYUN_USERNAME 或 ALIYUN_PASSWORD", { status: 500 });
+  }
+  const auth = `Basic ${btoa(`${username}:${password}`)}`;
+
   // ====================== 清单请求（manifests）才做状态检查与触发 ======================
   const parts = pathname.split('/');
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
     const ref = parts[parts.length - 1];
     if (ref.startsWith("sha256:")) {
-      // 摘要请求直接代理
-      return await fetch(proxy_url, { method: request.method, headers: request.headers, body: request.body, redirect: "follow" });
+      // 摘要请求直接代理（带认证）
+      return await fetch(proxy_url, { 
+        method: request.method, 
+        headers: { ...request.headers, Authorization: auth }, 
+        body: request.body, 
+        redirect: "follow" 
+      });
     }
 
     const image_name = parts.slice(2, parts.length - 2).join("/");
@@ -158,8 +173,13 @@ async function handleRegistry(request, kv, url) {
     const status = await kv.get(status_key);
 
     if (status === "ready") {
-      // 已构建好，直接代理
-      return await fetch(proxy_url, { method: request.method, headers: request.headers, body: request.body, redirect: "follow" });
+      // 已构建好，直接代理（带认证）
+      return await fetch(proxy_url, { 
+        method: request.method, 
+        headers: { ...request.headers, Authorization: auth }, 
+        body: request.body, 
+        redirect: "follow" 
+      });
     }
 
     if (status === "building") {
@@ -183,8 +203,13 @@ async function handleRegistry(request, kv, url) {
     });
   }
 
-  // 其他请求（blobs、tags/list 等）直接代理
-  return await fetch(proxy_url, { method: request.method, headers: request.headers, body: request.body, redirect: "follow" });
+  // 其他请求（blobs、tags/list 等）直接代理（带认证）
+  return await fetch(proxy_url, { 
+    method: request.method, 
+    headers: { ...request.headers, Authorization: auth }, 
+    body: request.body, 
+    redirect: "follow" 
+  });
 }
 
 /** ====================== 工具函数 ====================== */
