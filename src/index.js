@@ -3,8 +3,10 @@
  * 域名：tlju.qzz.io
  * 配置全部存放在 KV 命名空间 DOCKER_KV 中：
  * - ALIYUN_REGISTRY（默认 registry.cn-hangzhou.aliyuncs.com/tlju-docker-images）
- * - ALIYUN_USERNAME（阿里云 ACR 用户名）
- * - ALIYUN_PASSWORD（阿里云 ACR 密码，用于 Basic Auth）
+ * - ALIYUN_ACCESS_KEY_ID（阿里云 AK，用于获取临时 token）
+ * - ALIYUN_ACCESS_KEY_SECRET（阿里云 SK，用于签名 API 请求）
+ * - ALIYUN_REGION（例如 cn-hangzhou）
+ * - ALIYUN_INSTANCE_ID（企业版实例 ID，个人版留空 ''）
  * - GITHUB_OWNER / GITHUB_REPO / FILE_PATH / BRANCH / GH_TOKEN
  *
  * 使用方法：
@@ -119,6 +121,76 @@ async function handleWebhook(request, kv) {
   return json({ ok: true });
 }
 
+/** ====================== 阿里云 ACR 临时 token 获取 ====================== */
+async function getAcrAuth(kv) {
+  const tokenKey = "ALIYUN_ACR_TOKEN";
+  const usernameKey = "ALIYUN_ACR_USERNAME";
+  const tokenTtl = 1800; // 30 分钟缓存（token 有效 1 小时）
+
+  let token = await kv.get(tokenKey);
+  let tempUsername = await kv.get(usernameKey);
+
+  if (token && tempUsername) {
+    return `Basic ${btoa(`${tempUsername}:${token}`)}`;
+  }
+
+  const accessKeyId = await kv.get("ALIYUN_ACCESS_KEY_ID");
+  const accessKeySecret = await kv.get("ALIYUN_ACCESS_KEY_SECRET");
+  const region = await kv.get("ALIYUN_REGION") || "cn-hangzhou";
+  const instanceId = await kv.get("ALIYUN_INSTANCE_ID") || ""; // 个人版为空
+
+  if (!accessKeyId || !accessKeySecret || !region) {
+    throw new Error("KV 缺少 ALIYUN_ACCESS_KEY_ID, ALIYUN_ACCESS_KEY_SECRET 或 ALIYUN_REGION");
+  }
+
+  // 构建阿里云 API 请求参数
+  const params = {
+    Action: "GetAuthorizationToken",
+    Format: "JSON",
+    Version: "2016-06-07",
+    AccessKeyId: accessKeyId,
+    SignatureMethod: "HMAC-SHA1",
+    Timestamp: new Date().toISOString().replace(/\.\d{3}/, ""),
+    SignatureVersion: "1.0",
+    SignatureNonce: crypto.randomUUID(),
+  };
+  if (instanceId) {
+    params.InstanceId = instanceId;
+  }
+
+  // 排序 params 并构建 stringToSign
+  const sortedParams = Object.keys(params).sort().map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
+  const stringToSign = `GET&%2F&${encodeURIComponent(sortedParams)}`;
+
+  // HMAC-SHA1 签名
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(accessKeySecret + "&"), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(stringToSign));
+  const signature = btoa(String.fromCharCode(...new Uint8Array(sig)));
+
+  params.Signature = signature;
+
+  // 构建 API URL
+  const apiUrl = `https://cr.${region}.aliyuncs.com/?${Object.keys(params).map(key => `${key}=${encodeURIComponent(params[key])}`).join('&')}`;
+
+  // 调用 API
+  const response = await fetch(apiUrl);
+  const data = await response.json();
+
+  if (!response.ok || data.code !== "OK") {
+    throw new Error(`获取 ACR token 失败: ${data.message || data.error}`);
+  }
+
+  token = data.data.AuthorizationToken;
+  tempUsername = data.data.TempUserName || "cr_temp_user";
+
+  // 缓存 token 和 username
+  await kv.put(tokenKey, token, { expirationTtl: tokenTtl });
+  await kv.put(usernameKey, tempUsername, { expirationTtl: tokenTtl });
+
+  return `Basic ${btoa(`${tempUsername}:${token}`)}`;
+}
+
 /** ====================== 核心：Registry 代理 + 自动触发构建 ====================== */
 async function handleRegistry(request, kv, url) {
   const pathname = url.pathname;
@@ -142,13 +214,8 @@ async function handleRegistry(request, kv, url) {
 
   const proxy_url = `${aliyun_base}${proxy_path}${url.search}`;
 
-  // ====================== 获取阿里云认证信息 ======================
-  const username = await kv.get("ALIYUN_USERNAME");
-  const password = await kv.get("ALIYUN_PASSWORD");
-  if (!username || !password) {
-    return new Response("KV 缺少 ALIYUN_USERNAME 或 ALIYUN_PASSWORD", { status: 500 });
-  }
-  const auth = `Basic ${btoa(`${username}:${password}`)}`;
+  // ====================== 获取阿里云临时认证 ======================
+  const auth = await getAcrAuth(kv);
 
   // ====================== 清单请求（manifests）才做状态检查与触发 ======================
   const parts = pathname.split('/');
