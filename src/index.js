@@ -11,7 +11,7 @@
  * 1. 把 https://tlju.qzz.io 加入 /etc/docker/daemon.json 的 registry-mirrors
  * 2. docker pull redis / python / nginx …… 全部自动触发构建并拉取
  * 
- * 优化：manifests 先从 Hub 代理（如果存在），blobs 返回 503 直到 ACR 构建完成
+ * 优化：manifests tag 总是从 Hub 代理（获取层信息），并后台触发构建；blobs 返回 503 直到 ACR 构建完成，然后从 ACR 转发
  * 支持私有 ACR 认证，使用 Docker Registry token 流程
  */
 export default {
@@ -158,7 +158,7 @@ async function handleRegistry(request, kv, url) {
   // 解析镜像名（用于 KV status）
   let content = null;
   let status_key = null;
-  let status = null;
+  let status = await kv.get(status_key); // 默认 null
   const parts = pathname.split('/');
   if (parts.length >= 3) {
     const image_name = parts.slice(2, parts.length - 2).join("/") || parts[2];
@@ -172,62 +172,49 @@ async function handleRegistry(request, kv, url) {
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
     const ref = parts[parts.length - 1];
 
-    if (ref.startsWith("sha256:")) {
-      // 摘要 manifests：如果 ready，从 ACR 代理；否则从 Hub
-      if (status === 'ready') {
-        return await proxyWithAuth(acr_proxy_url, request, username, password, true); // ACR auth
-      } else {
-        return await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub no basic auth
-      }
-    }
-
-    // tag manifests：如果 ready，从 ACR；否则从 Hub（并触发构建）
-    if (status === 'ready') {
-      return await proxyWithAuth(acr_proxy_url, request, username, password, true);
-    } else {
-      const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false);
-      if (hub_response.ok) {
-        // Hub 有 manifest，检查是否需要触发构建
-        if (status !== 'building' && status !== 'failed') {
-          try {
-            await handleUpdate({ content }, kv);
-          } catch (err) {
-            // 忽略错误，继续返回 Hub manifest
-          }
+    // 总是从 Hub 代理 manifest，并后台触发构建如果未 start
+    const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
+    if (hub_response.ok) {
+      // 如果 Hub 有，检查是否需要触发构建
+      if (status !== 'ready' && status !== 'building') {
+        try {
+          await handleUpdate({ content }, kv);
+        } catch (err) {
+          // 忽略错误，继续返回 Hub manifest
         }
-        return hub_response;
-      } else {
-        return hub_response; // Hub 404 等，直接返回
       }
+      return hub_response;
+    } else {
+      // Hub 无，返回错误（如 404）
+      return hub_response;
     }
   }
 
   // ====================== 处理 blobs 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
+    // blobs 总是尝试从 ACR，如果 ready 返回；否则 503 重试（假设构建已触发）
     if (status === 'ready') {
-      return await proxyWithAuth(acr_proxy_url, request, username, password, true);
+      return await proxyWithAuth(acr_proxy_url, request, username, password, true); // ACR auth
     } else if (status === 'building') {
       return new Response("镜像 layers 正在构建中，请重试...", { status: 503, headers: { "Retry-After": "30" } });
     } else if (status === 'failed') {
       return new Response("镜像构建失败", { status: 500 });
     } else {
-      // 未开始，触发构建（假设 manifest 已从 Hub 获取）
-      try {
-        await handleUpdate({ content }, kv);
-      } catch (err) {
-        return new Response("启动构建失败: " + err.message, { status: 500 });
+      // 未开始，应在 manifest 时已触发，但以防万一
+      if (content) {
+        try {
+          await handleUpdate({ content }, kv);
+        } catch (err) {
+          return new Response("启动构建失败: " + err.message, { status: 500 });
+        }
       }
       return new Response("启动 layers 构建，请重试...", { status: 503, headers: { "Retry-After": "30" } });
     }
   }
 
   // ====================== 其他请求（如 tags/list） ======================
-  // 默认从 Hub 代理，如果 ready 从 ACR
-  if (status === 'ready') {
-    return await proxyWithAuth(acr_proxy_url, request, username, password, true);
-  } else {
-    return await proxyWithAuth(hub_proxy_url, request, null, null, false);
-  }
+  // 默认从 Hub 代理
+  return await proxyWithAuth(hub_proxy_url, request, null, null, false);
 }
 
 /** ====================== 代理请求 + 处理认证挑战 ====================== */
