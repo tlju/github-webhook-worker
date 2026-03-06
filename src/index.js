@@ -11,9 +11,8 @@
  * 1. 把 https://tlju.qzz.io 加入 /etc/docker/daemon.json 的 registry-mirrors
  * 2. docker pull redis / python / nginx …… 全部自动触发构建并拉取
  * 
- * 新增：支持私有 ACR 仓库认证，使用 Docker Registry token 认证流程（处理 401 challenge，获取 Bearer token）
- * 优化：对于 manifests tag 请求，先尝试代理，如果 200 则 set ready 并返回；如果 404 则检查状态/触发构建，返回 503 让 Docker 重试
- * 新流程：当镜像不存在时，从官方 Docker Hub 获取 manifest 返回给客户端（让 Docker 开始 pull layers），layers 请求返回 503 重试，直到构建完成
+ * 优化：manifests 先从 Hub 代理（如果存在），blobs 返回 503 直到 ACR 构建完成
+ * 支持私有 ACR 认证，使用 Docker Registry token 流程
  */
 export default {
   async fetch(request, env) {
@@ -141,145 +140,99 @@ async function handleRegistry(request, kv, url) {
   const repoPrefix = repoParts.join('/');                    // tlju-docker-images
   const aliyun_base = `https://${registryHost}`;
 
-  // 强制加上命名空间前缀
-  let proxy_path = pathname.replace(/^\/v2\/(library\/)?/, `/v2/${repoPrefix}/`);
+  // 阿里云 proxy path：添加 repoPrefix
+  let acr_proxy_path = pathname.replace(/^\/v2\/(library\/)?/, `/v2/${repoPrefix}/`);
+  const acr_proxy_url = `${aliyun_base}${acr_proxy_path}${url.search}`;
 
-  const proxy_url = `${aliyun_base}${proxy_path}${url.search}`;
+  // Docker Hub proxy path：保持原样（官方镜像有 library/）
+  const hub_base = 'https://registry-1.docker.io';
+  const hub_proxy_url = `${hub_base}${pathname}${url.search}`;
 
-  // 从 KV 获取认证信息
+  // 从 KV 获取 ACR 认证信息
   const username = await kv.get("ALIYUN_USERNAME");
   const password = await kv.get("ALIYUN_PASSWORD");
   if (!username || !password) {
     return new Response("KV 缺少 ALIYUN_USERNAME 或 ALIYUN_PASSWORD", { status: 500 });
   }
 
-  // ====================== 处理清单请求（manifests） ======================
+  // 解析镜像名（用于 KV status）
+  let content = null;
+  let status_key = null;
+  let status = null;
   const parts = pathname.split('/');
+  if (parts.length >= 3) {
+    const image_name = parts.slice(2, parts.length - 2).join("/") || parts[2];
+    const tag = (parts[parts.length - 1] && !parts[parts.length - 1].startsWith("sha256:")) ? parts[parts.length - 1] : "latest";
+    content = image_name.replace(/^library\//, "") + ":" + tag;
+    status_key = `IMAGE_STATUS_${content.replace(/[:/]/g, "_")}`;
+    status = await kv.get(status_key);
+  }
+
+  // ====================== 处理 manifests 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
     const ref = parts[parts.length - 1];
+
     if (ref.startsWith("sha256:")) {
-      // 摘要请求直接代理到阿里云（带认证）
-      return await proxyWithAuth(proxy_url, request, username, password);
+      // 摘要 manifests：如果 ready，从 ACR 代理；否则从 Hub
+      if (status === 'ready') {
+        return await proxyWithAuth(acr_proxy_url, request, username, password, true); // ACR auth
+      } else {
+        return await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub no basic auth
+      }
     }
 
-    const image_name = parts.slice(2, parts.length - 2).join("/");
-    const tag = ref || "latest";
-    const content = image_name.replace(/^library\//, "") + ":" + tag;
+    // tag manifests：如果 ready，从 ACR；否则从 Hub（并触发构建）
+    if (status === 'ready') {
+      return await proxyWithAuth(acr_proxy_url, request, username, password, true);
+    } else {
+      const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false);
+      if (hub_response.ok) {
+        // Hub 有 manifest，检查是否需要触发构建
+        if (status !== 'building' && status !== 'failed') {
+          try {
+            await handleUpdate({ content }, kv);
+          } catch (err) {
+            // 忽略错误，继续返回 Hub manifest
+          }
+        }
+        return hub_response;
+      } else {
+        return hub_response; // Hub 404 等，直接返回
+      }
+    }
+  }
 
-    const status_key = `IMAGE_STATUS_${content.replace(/[:/]/g, "_")}`;
-    const status = await kv.get(status_key);
-
-    if (status === "ready") {
-      // 已就绪，直接代理阿里云 manifest
-      return await proxyWithAuth(proxy_url, request, username, password);
-    } else if (status === "building") {
-      // 构建中，对于 manifest，返回官方 manifest，让 Docker 开始 pull layers
-      return await getOfficialManifest(request, image_name, tag);
-    } else if (status === "failed") {
+  // ====================== 处理 blobs 请求 ======================
+  if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
+    if (status === 'ready') {
+      return await proxyWithAuth(acr_proxy_url, request, username, password, true);
+    } else if (status === 'building') {
+      return new Response("镜像 layers 正在构建中，请重试...", { status: 503, headers: { "Retry-After": "30" } });
+    } else if (status === 'failed') {
       return new Response("镜像构建失败", { status: 500 });
     } else {
-      // 不存在，先尝试代理阿里云
-      let aliResponse = await proxyWithAuth(proxy_url, request, username, password);
-      if (aliResponse.ok) {
-        await kv.put(status_key, "ready");
-        return aliResponse;
-      } else if (aliResponse.status !== 404) {
-        return aliResponse; // 其他错误直接返回
-      }
-
-      // 阿里云 404，触发构建，并返回官方 manifest
+      // 未开始，触发构建（假设 manifest 已从 Hub 获取）
       try {
         await handleUpdate({ content }, kv);
       } catch (err) {
         return new Response("启动构建失败: " + err.message, { status: 500 });
       }
-
-      return await getOfficialManifest(request, image_name, tag);
+      return new Response("启动 layers 构建，请重试...", { status: 503, headers: { "Retry-After": "30" } });
     }
   }
 
-  // ====================== 处理 blobs (layers) 请求 ======================
-  if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
-    const digest = parts[parts.length - 1];
-    // 尝试从阿里云获取
-    let response = await proxyWithAuth(proxy_url, request, username, password);
-    if (response.ok) {
-      return response;
-    } else if (response.status === 404) {
-      // 如果 404，返回 503 让 Docker 重试
-      return new Response("Layer is building, retry later", {
-        status: 503,
-        headers: { "Retry-After": "30" }
-      });
-    } else {
-      return response;
-    }
+  // ====================== 其他请求（如 tags/list） ======================
+  // 默认从 Hub 代理，如果 ready 从 ACR
+  if (status === 'ready') {
+    return await proxyWithAuth(acr_proxy_url, request, username, password, true);
+  } else {
+    return await proxyWithAuth(hub_proxy_url, request, null, null, false);
   }
-
-  // 其他请求（如 tags/list）直接代理到阿里云
-  return await proxyWithAuth(proxy_url, request, username, password);
 }
 
-/** ====================== 新增：从官方 Docker Hub 获取 manifest ====================== */
-async function getOfficialManifest(request, image_name, tag) {
-  const official_base = "https://registry-1.docker.io";
-  const official_path = `/v2/${image_name}/manifests/${tag}`;
-  const official_url = `${official_base}${official_path}`;
-
-  // Docker Hub 也需要认证，类似阿里云
-  let response = await fetch(official_url, {
-    method: request.method,
-    headers: request.headers,
-    redirect: "follow"
-  });
-
-  if (response.status === 401) {
-    const wwwAuth = response.headers.get("WWW-Authenticate");
-    if (!wwwAuth) {
-      throw new Error("No WWW-Authenticate for Docker Hub");
-    }
-
-    const authParams = new Map(wwwAuth.split(',').map(p => p.trim().split('=').map(s => s.replace(/"/g, ''))));
-    const realm = authParams.get('realm');
-    const service = authParams.get('service');
-    const scope = authParams.get('scope');
-
-    let tokenUrl = `${realm}?service=${service}`;
-    if (scope) {
-      tokenUrl += `&scope=${encodeURIComponent(scope)}`;
-    }
-
-    // Docker Hub token 请求无需 Basic Auth（匿名 pull）
-    const tokenResponse = await fetch(tokenUrl);
-    if (!tokenResponse.ok) {
-      throw new Error(`Failed to get Docker Hub token: ${tokenResponse.status}`);
-    }
-
-    const tokenData = await tokenResponse.json();
-    const token = tokenData.token || tokenData.access_token;
-
-    const authHeaders = new Headers(request.headers);
-    authHeaders.set("Authorization", `Bearer ${token}`);
-
-    response = await fetch(official_url, {
-      method: request.method,
-      headers: authHeaders,
-      redirect: "follow"
-    });
-  }
-
-  if (!response.ok) {
-    return new Response("Failed to get official manifest", { status: response.status });
-  }
-
-  // 返回官方 manifest，headers 需调整（Content-Type 等）
-  const headers = new Headers(response.headers);
-  headers.set("Docker-Content-Digest", await response.headers.get("Docker-Content-Digest") || "");
-  return new Response(await response.blob(), { status: 200, headers });
-}
-
-/** ====================== 代理请求 + 处理 ACR 认证挑战 ====================== */
-async function proxyWithAuth(proxy_url, request, username, password) {
+/** ====================== 代理请求 + 处理认证挑战 ====================== */
+// isACR: true for ACR (use basic auth for token), false for Hub (anonymous token)
+async function proxyWithAuth(proxy_url, request, username, password, isACR) {
   let response = await fetch(proxy_url, {
     method: request.method,
     headers: request.headers,
@@ -288,15 +241,14 @@ async function proxyWithAuth(proxy_url, request, username, password) {
   });
 
   if (response.status === 401) {
-    // 处理 401 Unauthorized，获取 token
     const wwwAuth = response.headers.get("WWW-Authenticate");
     if (!wwwAuth) {
       throw new Error("No WWW-Authenticate header in 401 response");
     }
 
     // 解析 WWW-Authenticate
-    const authParams = new Map(wwwAuth.split(',').map(p => p.trim().split('=').map(s => s.replace(/"/g, ''))));
-    const realm = authParams.get('realm') || authParams.get('Bearer realm');
+    const authParams = new Map(wwwAuth.replace('Bearer ', '').split(',').map(p => p.trim().split('=').map(s => s.replace(/"/g, ''))));
+    const realm = authParams.get('realm');
     const service = authParams.get('service');
     const scope = authParams.get('scope');
 
@@ -304,17 +256,20 @@ async function proxyWithAuth(proxy_url, request, username, password) {
       throw new Error("No realm in WWW-Authenticate");
     }
 
-    // 构建 token 请求 URL
+    // 构建 token URL
     let tokenUrl = `${realm}?service=${service}`;
     if (scope) {
       tokenUrl += `&scope=${encodeURIComponent(scope)}`;
     }
 
-    // 使用 Basic Auth 请求 token
-    const basicAuth = `Basic ${btoa(`${username}:${password}`)}`;
-    const tokenResponse = await fetch(tokenUrl, {
-      headers: { Authorization: basicAuth }
-    });
+    // 请求 token：ACR 用 basic auth，Hub 匿名
+    const tokenHeaders = new Headers();
+    if (isACR) {
+      const basicAuth = `Basic ${btoa(`${username}:${password}`)}`;
+      tokenHeaders.set("Authorization", basicAuth);
+    }
+
+    const tokenResponse = await fetch(tokenUrl, { headers: tokenHeaders });
 
     if (!tokenResponse.ok) {
       throw new Error(`Failed to get token: ${tokenResponse.status}`);
@@ -327,7 +282,7 @@ async function proxyWithAuth(proxy_url, request, username, password) {
       throw new Error("No token in response");
     }
 
-    // 用 Bearer token 重试原请求
+    // 用 Bearer token 重试
     const authHeaders = new Headers(request.headers);
     authHeaders.set("Authorization", `Bearer ${token}`);
 
