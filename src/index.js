@@ -13,6 +13,7 @@
  * 
  * 新增：支持私有 ACR 仓库认证，使用 Docker Registry token 认证流程（处理 401 challenge，获取 Bearer token）
  * 优化：对于 manifests tag 请求，先尝试代理，如果 200 则 set ready 并返回；如果 404 则检查状态/触发构建，返回 503 让 Docker 重试
+ * 注意：Docker 客户端可能不自动重试 503，请使用 shell 循环手动重试，如 until docker pull redis; do sleep 30; done
  */
 export default {
   async fetch(request, env) {
@@ -182,9 +183,9 @@ async function handleRegistry(request, kv, url) {
       // 如果 404，检查状态
       const status = await kv.get(status_key);
       if (status === "building") {
-        return new Response(null, { status: 503, headers: { "Retry-After": "30" } });
+        return new Response("镜像正在构建中，请在 30 秒后重试 pull 命令...", { status: 503, headers: { "Retry-After": "30" } });
       } else if (status === "failed") {
-        return new Response(null, { status: 500 });
+        return new Response("镜像构建失败，请检查 Workflow 日志", { status: 500 });
       } else {
         // 触发构建
         try {
@@ -192,7 +193,10 @@ async function handleRegistry(request, kv, url) {
         } catch (err) {
           return new Response("启动构建失败: " + err.message, { status: 500 });
         }
-        return new Response(null, { status: 503, headers: { "Retry-After": "30" } });
+        return new Response("正在启动镜像构建，请在 30 秒后重试 pull 命令...", {
+          status: 503,
+          headers: { "Retry-After": "30" }
+        });
       }
     } else {
       // 其他状态码，直接返回（例如 401 已由 proxyWithAuth 处理）
