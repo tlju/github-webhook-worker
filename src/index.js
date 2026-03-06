@@ -176,25 +176,25 @@ async function handleRegistry(request, kv, url) {
 
   // ====================== 处理 manifests 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
-    const ref = parts[parts.length - 1];
+  const ref = parts[parts.length - 1];
 
-    // 总是从 Hub 代理 manifest，并后台触发构建如果未 start 或不匹配当前镜像
-    const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
-    if (hub_response.ok) {
-      // 如果 Hub 有，检查是否需要触发构建
-      if (!last_workflow || last_workflow.content !== content || last_workflow.status !== 'building' && last_workflow.status !== 'completed') {
-        try {
-          await handleUpdate({ content }, kv);
-        } catch (err) {
-          // 忽略错误，继续返回 Hub manifest
-        }
+  // 总是从 Hub 代理 manifest，并后台触发构建如果未 start 或不匹配当前镜像
+  const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
+  if (hub_response.ok) {
+    // 如果 Hub 有，检查是否需要触发构建（只在 GET 时触发，避免 HEAD/GET 双触发）
+    if (request.method === "GET" && (!last_workflow || last_workflow.content !== content || last_workflow.status !== 'building')) {
+      try {
+        await handleUpdate({ content }, kv);
+      } catch (err) {
+        // 忽略错误，继续返回 Hub manifest
       }
-      return hub_response;
-    } else {
-      // Hub 无，返回错误（如 404）
-      return hub_response;
     }
+    return hub_response;
+  } else {
+    // Hub 无，返回错误（如 404）
+    return hub_response;
   }
+}
 
   // ====================== 处理 blobs 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
