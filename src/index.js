@@ -14,6 +14,7 @@
  * 优化：manifests tag 总是从 Hub 代理（获取层信息），并后台触发构建；blobs 返回 503 直到 ACR 构建完成，然后从 ACR 转发
  * 支持私有 ACR 认证，使用 Docker Registry token 流程
  * 修改：只用 LAST_WORKFLOW KV，支持单个 workflow，增加 503 响应中的状态信息
+ * 修复：只在 manifests GET 请求时触发 update，避免 HEAD/GET 双触发
  */
 export default {
   async fetch(request, env) {
@@ -176,25 +177,25 @@ async function handleRegistry(request, kv, url) {
 
   // ====================== 处理 manifests 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
-  const ref = parts[parts.length - 1];
+    const ref = parts[parts.length - 1];
 
-  // 总是从 Hub 代理 manifest，并后台触发构建如果未 start 或不匹配当前镜像
-  const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
-  if (hub_response.ok) {
-    // 如果 Hub 有，检查是否需要触发构建（只在 GET 时触发，避免 HEAD/GET 双触发）
-    if (request.method === "GET" && (!last_workflow || last_workflow.content !== content || last_workflow.status !== 'building')) {
-      try {
-        await handleUpdate({ content }, kv);
-      } catch (err) {
-        // 忽略错误，继续返回 Hub manifest
+    // 总是从 Hub 代理 manifest，并后台触发构建如果未 start 或不匹配当前镜像
+    const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
+    if (hub_response.ok) {
+      // 如果 Hub 有，检查是否需要触发构建（只在 GET 时触发，避免 HEAD/GET 双触发）
+      if (request.method === "GET" && (!last_workflow || last_workflow.content !== content || last_workflow.status !== 'building')) {
+        try {
+          await handleUpdate({ content }, kv);
+        } catch (err) {
+          // 忽略错误，继续返回 Hub manifest
+        }
       }
+      return hub_response;
+    } else {
+      // Hub 无，返回错误（如 404）
+      return hub_response;
     }
-    return hub_response;
-  } else {
-    // Hub 无，返回错误（如 404）
-    return hub_response;
   }
-}
 
   // ====================== 处理 blobs 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
