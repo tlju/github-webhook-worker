@@ -158,7 +158,7 @@ async function handleRegistry(request, kv, url) {
   // 解析镜像名（用于 KV status）
   let content = null;
   let status_key = null;
-  let status = await kv.get(status_key); // 默认 null
+  let status = null;
   const parts = pathname.split('/');
   if (parts.length >= 3) {
     const image_name = parts.slice(2, parts.length - 2).join("/") || parts[2];
@@ -196,7 +196,7 @@ async function handleRegistry(request, kv, url) {
     if (status === 'ready') {
       return await proxyWithAuth(acr_proxy_url, request, username, password, true); // ACR auth
     } else if (status === 'building') {
-      return new Response("镜像 layers 正在构建中，请重试...", { status: 503, headers: { "Retry-After": "30" } });
+      return new Response("镜像 layers 正在构建中，请重试...", { status: 503, headers: { "Retry-After": "60" } });
     } else if (status === 'failed') {
       return new Response("镜像构建失败", { status: 500 });
     } else {
@@ -208,7 +208,7 @@ async function handleRegistry(request, kv, url) {
           return new Response("启动构建失败: " + err.message, { status: 500 });
         }
       }
-      return new Response("启动 layers 构建，请重试...", { status: 503, headers: { "Retry-After": "30" } });
+      return new Response("启动 layers 构建，请重试...", { status: 503, headers: { "Retry-After": "60" } });
     }
   }
 
