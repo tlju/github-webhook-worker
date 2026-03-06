@@ -5,7 +5,7 @@
  * - ALIYUN_REGISTRY（默认 registry.cn-hangzhou.aliyuncs.com/tlju-docker-images）
  * - ALIYUN_USERNAME（阿里云 ACR 用户名，用于认证）
  * - ALIYUN_PASSWORD（阿里云 ACR 密码，用于认证）
- * - GITHUB_OWNER / GITHUB_REPO / FILE_PATH / BRANCH / GH_TOKEN
+ * - GITHUB_OWNER / GITHUB_REPO / FILE_PATH / BRANCH / GITHUB_TOKEN
  *
  * 使用方法：
  * 1. 把 https://tlju.qzz.io 加入 /etc/docker/daemon.json 的 registry-mirrors
@@ -13,6 +13,7 @@
  * 
  * 优化：manifests tag 总是从 Hub 代理（获取层信息），并后台触发构建；blobs 返回 503 直到 ACR 构建完成，然后从 ACR 转发
  * 支持私有 ACR 认证，使用 Docker Registry token 流程
+ * 修改：只用 LAST_WORKFLOW KV，支持单个 workflow，增加 503 响应中的状态信息
  */
 export default {
   async fetch(request, env) {
@@ -43,7 +44,7 @@ async function handleUpdate(body, kv) {
     repo: await kv.get("GITHUB_REPO"),
     path: await kv.get("FILE_PATH"),
     branch: await kv.get("BRANCH") || "main",
-    token: await kv.get("GH_TOKEN")
+    token: await kv.get("GITHUB_TOKEN")
   };
   if (!config.owner || !config.repo || !config.path || !config.token) {
     throw new Error("KV 缺少必要配置项");
@@ -67,9 +68,13 @@ async function handleUpdate(body, kv) {
 
   await kv.delete("LAST_WORKFLOW");
 
-  // 标记为正在构建
-  const status_key = `IMAGE_STATUS_${body.content.replace(/[:/]/g, '_')}`;
-  await kv.put(status_key, 'building');
+  // 标记为正在构建，存入 content
+  const info = {
+    status: 'building',
+    content: body.content,
+    time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+  };
+  await kv.put("LAST_WORKFLOW", JSON.stringify(info));
 
   // 轮询找到刚触发的 workflow run ID（最多等 30 秒）
   let run = null;
@@ -85,11 +90,13 @@ async function handleUpdate(body, kv) {
     }
   }
   if (!run) {
-    await kv.put(status_key, 'failed');
+    info.status = 'failed';
+    await kv.put("LAST_WORKFLOW", JSON.stringify(info));
     throw new Error('未找到触发的 Workflow');
   }
 
-  await kv.put(`IMAGE_FOR_WORKFLOW_${run.id}`, body.content);
+  info.id = run.id;
+  await kv.put("LAST_WORKFLOW", JSON.stringify(info));
   return { ok: true, sha: updateResult.commit.sha };
 }
 
@@ -99,24 +106,23 @@ async function handleWebhook(request, kv) {
   const payload = await request.json();
 
   if (payload.workflow_run) {
-    const info = {
-      id: payload.workflow_run.id,
-      name: payload.workflow_run.name,
-      status: payload.workflow_run.status,
-      conclusion: payload.workflow_run.conclusion,
-      head_branch: payload.workflow_run.head_branch,
-      updated_at: payload.workflow_run.updated_at,
-      time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
-    };
-    await kv.put("LAST_WORKFLOW", JSON.stringify(info));
+    // 获取当前 LAST_WORKFLOW
+    let current = await kv.get("LAST_WORKFLOW");
+    current = current ? JSON.parse(current) : null;
 
-    if (payload.workflow_run.status === "completed") {
-      const run_id = payload.workflow_run.id;
-      const image = await kv.get(`IMAGE_FOR_WORKFLOW_${run_id}`);
-      if (image) {
-        const status_key = `IMAGE_STATUS_${image.replace(/[:/]/g, '_')}`;
-        await kv.put(status_key, payload.workflow_run.conclusion === "success" ? 'ready' : 'failed');
-      }
+    // 只处理匹配的 workflow id
+    if (current && current.id === payload.workflow_run.id) {
+      const info = {
+        id: payload.workflow_run.id,
+        name: payload.workflow_run.name,
+        status: payload.workflow_run.status,
+        conclusion: payload.workflow_run.conclusion,
+        head_branch: payload.workflow_run.head_branch,
+        updated_at: payload.workflow_run.updated_at,
+        time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+        content: current.content  // 保留镜像名
+      };
+      await kv.put("LAST_WORKFLOW", JSON.stringify(info));
     }
   }
   return json({ ok: true });
@@ -155,28 +161,28 @@ async function handleRegistry(request, kv, url) {
     return new Response("KV 缺少 ALIYUN_USERNAME 或 ALIYUN_PASSWORD", { status: 500 });
   }
 
-  // 解析镜像名（用于 KV status）
+  // 解析镜像名（用于比较）
   let content = null;
-  let status_key = null;
-  let status = null;
   const parts = pathname.split('/');
   if (parts.length >= 3) {
     const image_name = parts.slice(2, parts.length - 2).join("/") || parts[2];
     const tag = (parts[parts.length - 1] && !parts[parts.length - 1].startsWith("sha256:")) ? parts[parts.length - 1] : "latest";
     content = image_name.replace(/^library\//, "") + ":" + tag;
-    status_key = `IMAGE_STATUS_${content.replace(/[:/]/g, "_")}`;
-    status = await kv.get(status_key);
   }
+
+  // 获取当前 LAST_WORKFLOW 状态
+  let last_workflow = await kv.get("LAST_WORKFLOW");
+  last_workflow = last_workflow ? JSON.parse(last_workflow) : null;
 
   // ====================== 处理 manifests 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "manifests") {
     const ref = parts[parts.length - 1];
 
-    // 总是从 Hub 代理 manifest，并后台触发构建如果未 start
+    // 总是从 Hub 代理 manifest，并后台触发构建如果未 start 或不匹配当前镜像
     const hub_response = await proxyWithAuth(hub_proxy_url, request, null, null, false); // Hub auth
     if (hub_response.ok) {
       // 如果 Hub 有，检查是否需要触发构建
-      if (status !== 'ready' && status !== 'building') {
+      if (!last_workflow || last_workflow.content !== content || last_workflow.status !== 'building' && last_workflow.status !== 'completed') {
         try {
           await handleUpdate({ content }, kv);
         } catch (err) {
@@ -192,15 +198,17 @@ async function handleRegistry(request, kv, url) {
 
   // ====================== 处理 blobs 请求 ======================
   if (parts.length >= 4 && parts[parts.length - 2] === "blobs") {
-    // blobs 总是尝试从 ACR，如果 ready 返回；否则 503 重试（假设构建已触发）
-    if (status === 'ready') {
+    // blobs 总是尝试从 ACR，如果 LAST_WORKFLOW 是当前镜像且 ready，返回；否则 503 + 状态信息
+    if (last_workflow && last_workflow.content === content && last_workflow.status === 'completed' && last_workflow.conclusion === 'success') {
       return await proxyWithAuth(acr_proxy_url, request, username, password, true); // ACR auth
-    } else if (status === 'building') {
-      return new Response("镜像 layers 正在构建中，请重试...", { status: 503, headers: { "Retry-After": "60" } });
-    } else if (status === 'failed') {
-      return new Response("镜像构建失败", { status: 500 });
+    } else if (last_workflow && last_workflow.content === content && last_workflow.status === 'building') {
+      const msg = `镜像 ${content} 正在构建中，当前状态: ${last_workflow.status}，更新时间: ${last_workflow.time}`;
+      return new Response(msg, { status: 503, headers: { "Retry-After": "60" } });
+    } else if (last_workflow && last_workflow.content === content && last_workflow.status === 'failed') {
+      const msg = `镜像 ${content} 构建失败，结论: ${last_workflow.conclusion}，更新时间: ${last_workflow.time}`;
+      return new Response(msg, { status: 500 });
     } else {
-      // 未开始，应在 manifest 时已触发，但以防万一
+      // 未开始或不匹配，应在 manifest 时已触发，但以防万一
       if (content) {
         try {
           await handleUpdate({ content }, kv);
@@ -208,7 +216,8 @@ async function handleRegistry(request, kv, url) {
           return new Response("启动构建失败: " + err.message, { status: 500 });
         }
       }
-      return new Response("启动 layers 构建，请重试...", { status: 503, headers: { "Retry-After": "60" } });
+      const msg = `启动 ${content} 构建，请重试...`;
+      return new Response(msg, { status: 503, headers: { "Retry-After": "60" } });
     }
   }
 
